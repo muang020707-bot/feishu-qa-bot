@@ -74,7 +74,7 @@ exports.handler = async function handler(request, response) {
       return sendJson(response, 200, { ok: true });
     }
 
-    if (method !== "POST" || path !== "/feishu/events") {
+    if (method !== "POST") {
       return sendJson(response, 404, { error: "not found" });
     }
 
