@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/feishu/events",
+      "destination": "/api/feishu/events"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/health"
+    }
+  ]
+}
