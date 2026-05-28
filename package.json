@@ -1,0 +1,14 @@
+{
+  "name": "feishu-qa-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "smoke": "node scripts/local-smoke-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

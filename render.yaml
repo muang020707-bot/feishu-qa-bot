@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: feishu-qa-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FEISHU_APP_ID
+        value: cli_aa9d674eedba1bdd
+      - key: FEISHU_APP_SECRET
+        sync: false
+      - key: BOT_OPEN_ID
+        value: ou_9787aa3d09d2dc2148de1b9d0707b081
+      - key: KNOWLEDGE_SOURCE_URLS
+        value: https://vcnh0ynuo3yd.feishu.cn/wiki/G5vLwatTWisiuGkrVITcgompnod?fromScene=spaceOverview,https://vcnh0ynuo3yd.feishu.cn/drive/folder/Pe45fe0GolwNNKdZ3GlcwKuwnqb
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: FEISHU_VERIFICATION_TOKEN
+        sync: false
