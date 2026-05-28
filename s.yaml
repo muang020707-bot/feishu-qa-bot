@@ -30,5 +30,7 @@ resources:
         BOT_OPEN_ID: ${env(BOT_OPEN_ID)}
         KNOWLEDGE_SOURCE_URLS: ${env(KNOWLEDGE_SOURCE_URLS)}
         OPENAI_MODEL: ${env(OPENAI_MODEL)}
-        OPENAI_API_KEY: ${env(OPENAI_API_KEY)}
+        OPENAI_API_KEY: ${env(OPENAI_API_KEY, "")}
+        OPENAI_BASE_URL: ${env(OPENAI_BASE_URL, "https://dashscope.aliyuncs.com/compatible-mode/v1")}
+        DASHSCOPE_API_KEY: ${env(DASHSCOPE_API_KEY)}
         FEISHU_VERIFICATION_TOKEN: ${env(FEISHU_VERIFICATION_TOKEN, "unused")}

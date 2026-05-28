@@ -134,3 +134,10 @@ test("handles mentioned event with mocked dependencies", async () => {
   assert.equal(result.ignored, false);
   assert.match(replied, /打卡/);
 });
+
+test("extracts text from OpenAI-compatible chat completions", () => {
+  assert.equal(
+    bot.extractModelText({ choices: [{ message: { content: "千问回答" } }] }),
+    "千问回答"
+  );
+});

@@ -5,12 +5,13 @@ Use this when Feishu callback verification times out against overseas/serverless
 ## Required environment variables
 
 ```text
-OPENAI_API_KEY=<secret>
+DASHSCOPE_API_KEY=<阿里云百炼 DashScope API Key>
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 FEISHU_APP_ID=cli_aa9d674eedba1bdd
 FEISHU_APP_SECRET=<secret>
 BOT_OPEN_ID=ou_9787aa3d09d2dc2148de1b9d0707b081
 KNOWLEDGE_SOURCE_URLS=https://vcnh0ynuo3yd.feishu.cn/wiki/G5vLwatTWisiuGkrVITcgompnod?fromScene=spaceOverview,https://vcnh0ynuo3yd.feishu.cn/drive/folder/Pe45fe0GolwNNKdZ3GlcwKuwnqb
-OPENAI_MODEL=gpt-4.1-mini
+OPENAI_MODEL=qwen-plus
 FEISHU_VERIFICATION_TOKEN=
 ```
 

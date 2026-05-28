@@ -3,8 +3,8 @@
 const https = require("https");
 
 const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
-const OPENAI_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_MODEL = "gpt-4.1-mini";
+const DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const DEFAULT_MODEL = "qwen-plus";
 const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。建议联系对应负责人确认，或把正确文档链接补充到知识库后再问我。";
 
 function getEnv(name, fallback = "") {
@@ -277,11 +277,11 @@ async function askOpenAI(question, chunks, config) {
   const context = chunks
     .map((chunk, index) => `资料${index + 1}：${chunk.title}\n${chunk.text}`)
     .join("\n\n---\n\n");
-  const data = await jsonRequest("POST", `${OPENAI_BASE_URL}/responses`, {
+  const data = await jsonRequest("POST", `${config.openaiBaseUrl || DEFAULT_LLM_BASE_URL}/chat/completions`, {
     headers: { Authorization: `Bearer ${config.openaiApiKey}` },
     body: {
       model: config.openaiModel || DEFAULT_MODEL,
-      input: [
+      messages: [
         {
           role: "system",
           content: "你是公司内部飞书问答机器人。只基于提供的资料回答。资料没有明确依据时，回复知识库暂无明确答案，不要编造制度、薪资、合同、审批结论。回答要简洁、中文。"
@@ -293,11 +293,14 @@ async function askOpenAI(question, chunks, config) {
       ]
     }
   });
-  const text = extractOpenAIText(data).trim();
+  const text = extractModelText(data).trim();
   return text || NO_ANSWER;
 }
 
-function extractOpenAIText(data) {
+function extractModelText(data) {
+  if (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) {
+    return data.choices[0].message.content;
+  }
   if (typeof data.output_text === "string") return data.output_text;
   const parts = [];
   for (const item of data.output || []) {
@@ -320,7 +323,8 @@ async function replyToFeishuMessage(messageId, text, tenantAccessToken) {
 
 function getConfig() {
   return {
-    openaiApiKey: getEnv("OPENAI_API_KEY"),
+    openaiApiKey: getEnv("DASHSCOPE_API_KEY") || getEnv("OPENAI_API_KEY"),
+    openaiBaseUrl: getEnv("OPENAI_BASE_URL", DEFAULT_LLM_BASE_URL),
     feishuAppId: getEnv("FEISHU_APP_ID"),
     feishuAppSecret: getEnv("FEISHU_APP_SECRET"),
     botOpenId: getEnv("BOT_OPEN_ID"),
@@ -364,4 +368,5 @@ module.exports.extractFeishuLink = extractFeishuLink;
 module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
 module.exports.getWikiNode = getWikiNode;
+module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
