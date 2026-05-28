@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { verifyFeishuToken } = require("../render-server");
+const { verifyFeishuToken } = require("../server");
 
 test("accepts callback token when no token is configured", () => {
   const old = process.env.FEISHU_VERIFICATION_TOKEN;
