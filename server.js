@@ -30,7 +30,7 @@ function readJson(req) {
 
 function verifyFeishuToken(payload) {
   const expected = process.env.FEISHU_VERIFICATION_TOKEN;
-  if (!expected) return true;
+  if (!expected || expected === "unused") return true;
   return payload && payload.token === expected;
 }
 
