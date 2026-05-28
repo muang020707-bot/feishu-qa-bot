@@ -1,0 +1,34 @@
+edition: 3.0.0
+name: feishu-qa-bot
+access: default
+
+resources:
+  feishuQaBot:
+    component: fc3
+    props:
+      region: cn-hangzhou
+      functionName: feishu-qa-bot
+      description: Feishu knowledge-base Q&A bot callback
+      runtime: nodejs18
+      code: .
+      handler: aliyun-handler.handler
+      memorySize: 512
+      timeout: 60
+      triggers:
+        - triggerName: feishu-http
+          triggerType: http
+          description: Feishu event callback
+          qualifier: LATEST
+          triggerConfig:
+            methods:
+              - GET
+              - POST
+            authType: anonymous
+      environmentVariables:
+        FEISHU_APP_ID: ${env(FEISHU_APP_ID)}
+        FEISHU_APP_SECRET: ${env(FEISHU_APP_SECRET)}
+        BOT_OPEN_ID: ${env(BOT_OPEN_ID)}
+        KNOWLEDGE_SOURCE_URLS: ${env(KNOWLEDGE_SOURCE_URLS)}
+        OPENAI_MODEL: ${env(OPENAI_MODEL)}
+        OPENAI_API_KEY: ${env(OPENAI_API_KEY)}
+        FEISHU_VERIFICATION_TOKEN: ${env(FEISHU_VERIFICATION_TOKEN)}

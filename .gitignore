@@ -16,3 +16,8 @@ qrcode.*
 wiki-move-results.json
 aily-js/
 extracted-hr-kb/
+
+.vercel
+.s/
+.fc/
+feishu-qa-bot-render-upload.zip
