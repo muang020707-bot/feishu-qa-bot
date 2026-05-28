@@ -1,7 +1,5 @@
 "use strict";
 
-const { handleFeishuEvent } = require("./src/feishu-qa-bot");
-
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
   res.statusCode = statusCode;
@@ -62,6 +60,7 @@ module.exports = async function handler(req, res) {
         return;
       }
 
+      const { handleFeishuEvent } = require("./src/feishu-qa-bot");
       const result = await handleFeishuEvent(payload);
       sendJson(res, 200, result);
       return;
