@@ -15,6 +15,9 @@ function sendJson(response, statusCode, data) {
 }
 
 function readRequestBody(request) {
+  if (request && request.body !== undefined) {
+    return Promise.resolve(Buffer.isBuffer(request.body) ? request.body.toString("utf8") : String(request.body || ""));
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
