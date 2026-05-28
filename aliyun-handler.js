@@ -74,16 +74,16 @@ exports.handler = async function handler(request, response) {
       return sendJson(response, 200, { ok: true });
     }
 
-    if (method !== "POST") {
-      return sendJson(response, 404, { error: "not found" });
-    }
-
     const payload = parseJsonBody(eventMode ? httpEvent.body : await readRequestBody(request));
     if (payload.challenge) {
       if (!verifyFeishuToken(payload)) {
         return sendJson(response, 403, { error: "invalid token" });
       }
       return sendJson(response, 200, { challenge: payload.challenge });
+    }
+
+    if (!payload.event && !payload.message) {
+      return sendJson(response, 404, { error: "not found" });
     }
 
     if (!verifyFeishuToken(payload)) {
