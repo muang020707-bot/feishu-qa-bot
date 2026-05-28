@@ -9,9 +9,17 @@ function headerValue(headers, name) {
 }
 
 function sendJson(response, statusCode, data) {
+  if (!response || typeof response.setStatusCode !== "function") {
+    return {
+      statusCode,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(data)
+    };
+  }
   response.setStatusCode(statusCode);
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.send(JSON.stringify(data));
+  return undefined;
 }
 
 function readRequestBody(request) {
@@ -35,6 +43,16 @@ function parseJsonBody(raw) {
   }
 }
 
+function parseHttpEvent(event) {
+  const raw = Buffer.isBuffer(event) ? event.toString("utf8") : event;
+  const parsed = typeof raw === "string" ? parseJsonBody(raw) : raw || {};
+  return {
+    method: parsed.httpMethod || parsed.requestContext && parsed.requestContext.httpMethod || "GET",
+    path: parsed.path || parsed.rawPath || parsed.requestContext && parsed.requestContext.path || "/",
+    body: parsed.isBase64Encoded ? Buffer.from(parsed.body || "", "base64").toString("utf8") : parsed.body || ""
+  };
+}
+
 function verifyFeishuToken(payload) {
   const expected = process.env.FEISHU_VERIFICATION_TOKEN;
   if (!expected || expected === "unused") return true;
@@ -43,39 +61,40 @@ function verifyFeishuToken(payload) {
 
 exports.handler = async function handler(request, response) {
   try {
-    const method = headerValue(request.headers, "x-fc-request-method") || request.method || "GET";
-    const path = headerValue(request.headers, "x-fc-request-path") || request.path || "/";
+    const eventMode = !response || typeof response.setStatusCode !== "function";
+    const httpEvent = eventMode ? parseHttpEvent(request) : null;
+    const method = eventMode
+      ? httpEvent.method
+      : headerValue(request.headers, "x-fc-request-method") || request.method || "GET";
+    const path = eventMode
+      ? httpEvent.path
+      : headerValue(request.headers, "x-fc-request-path") || request.path || "/";
 
     if (method === "GET" && path === "/health") {
-      sendJson(response, 200, { ok: true });
-      return;
+      return sendJson(response, 200, { ok: true });
     }
 
     if (method !== "POST" || path !== "/feishu/events") {
-      sendJson(response, 404, { error: "not found" });
-      return;
+      return sendJson(response, 404, { error: "not found" });
     }
 
-    const payload = parseJsonBody(await readRequestBody(request));
+    const payload = parseJsonBody(eventMode ? httpEvent.body : await readRequestBody(request));
     if (payload.challenge) {
       if (!verifyFeishuToken(payload)) {
-        sendJson(response, 403, { error: "invalid token" });
-        return;
+        return sendJson(response, 403, { error: "invalid token" });
       }
-      sendJson(response, 200, { challenge: payload.challenge });
-      return;
+      return sendJson(response, 200, { challenge: payload.challenge });
     }
 
     if (!verifyFeishuToken(payload)) {
-      sendJson(response, 403, { error: "invalid token" });
-      return;
+      return sendJson(response, 403, { error: "invalid token" });
     }
 
     const result = await handleFeishuEvent(payload);
-    sendJson(response, 200, result);
+    return sendJson(response, 200, result);
   } catch (error) {
     console.error(error);
-    sendJson(response, 500, { error: "internal error" });
+    return sendJson(response, 500, { error: "internal error" });
   }
 };
 
