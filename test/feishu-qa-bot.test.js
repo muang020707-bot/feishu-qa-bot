@@ -35,6 +35,18 @@ test("normalizes question by removing the bot mention", () => {
   assert.equal(actual, "公司考勤是怎么样的");
 });
 
+test("supports multiple bot open ids for mention matching", () => {
+  assert.equal(
+    bot.shouldReplyToEvent(
+      event("@_user_1 公司考勤是怎么样的", [
+        { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_alt_bot" } }
+      ]),
+      "ou_primary_bot,ou_alt_bot"
+    ),
+    true
+  );
+});
+
 test("retrieves relevant chunks from knowledge documents", () => {
   const chunks = bot.retrieveRelevantChunks("公司考勤是怎么样的", [
     {

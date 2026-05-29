@@ -95,14 +95,16 @@ function shouldReplyToEvent(event, botOpenId) {
   const message = eventMessage(event);
   const mentions = message.mentions || [];
   if (!botOpenId) return mentions.length > 0;
-  return mentions.some((mention) => mention.id === botOpenId || (mention.id && mention.id.open_id === botOpenId));
+  const botIds = splitCsv(botOpenId);
+  return mentions.some((mention) => botIds.includes(mention.id) || (mention.id && botIds.includes(mention.id.open_id)));
 }
 
 function normalizeQuestion(event, botOpenId) {
   const message = eventMessage(event);
   let text = parseTextMessageContent(message.content);
+  const botIds = splitCsv(botOpenId);
   for (const mention of message.mentions || []) {
-    if (!botOpenId || mention.id === botOpenId || (mention.id && mention.id.open_id === botOpenId)) {
+    if (!botOpenId || botIds.includes(mention.id) || (mention.id && botIds.includes(mention.id.open_id))) {
       if (mention.key) text = text.replaceAll(mention.key, "");
       if (mention.name) text = text.replace(new RegExp(`@?${escapeRegExp(mention.name)}`, "g"), "");
     }
