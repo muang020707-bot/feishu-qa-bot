@@ -104,6 +104,24 @@ test("hydrates matching uploaded files before answering", async () => {
   assert.equal(hydrated[0].canExtractContent, false);
 });
 
+test("hydrates old doc files with readable text extraction", async () => {
+  const title = "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc";
+  const initialChunks = bot.retrieveRelevantChunks("DISC测评怎么做", [
+    {
+      title,
+      url: "https://example.feishu.cn/file/disc",
+      content: title,
+      fileToken: "file-disc",
+      fileExtension: "doc",
+      canExtractContent: true
+    }
+  ]);
+  const hydrated = await bot.hydrateRelevantChunks("DISC测评怎么做", initialChunks, "tenant-token", {
+    downloadDriveFile: async () => Buffer.from("DISC personality test answers should follow the questionnaire", "utf8")
+  });
+  assert.match(hydrated[0].text, /DISC personality test/);
+});
+
 test("recognizes direct material requests", () => {
   assert.equal(bot.isKnowledgeMaterialRequest("给我劳动合同"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("发一下员工手册文档"), true);
@@ -146,6 +164,37 @@ test("finds personality test materials with synonym matching", () => {
   ]);
   assert.ok(materials.length > 0);
   assert.equal(materials[0].title, "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc");
+});
+
+test("uses inferred title hints when local material matching misses", async () => {
+  let replied = "";
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 给我九型人格资料", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "01-招聘管理 - PDP行为风格测试和解析.doc",
+          url: "https://example.feishu.cn/file/pdp",
+          content: "01-招聘管理 - PDP行为风格测试和解析.doc"
+        }
+      ],
+      inferKnowledgeHints: async () => ({ keywords: ["PDP", "行为风格"], titleIndexes: [0] }),
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.materialMatches, 1);
+  assert.equal(result.hintedTitles, 1);
+  assert.match(replied, /PDP行为风格测试/);
 });
 
 test("recognizes knowledge refresh requests", () => {
@@ -336,6 +385,39 @@ test("hydrates uploaded file matches in mentioned events", async () => {
   assert.equal(result.ignored, false);
   assert.match(modelChunks[0].text, /入职注意事项/);
   assert.match(replied, /依据文档/);
+});
+
+test("uses inferred title hints for answer retrieval fallback", async () => {
+  let modelChunks = [];
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 这个岗位候选人要先做什么评估", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "01-招聘管理 - DISC性格测评问卷.docx",
+          url: "https://example.feishu.cn/file/disc",
+          content: "候选人需要先完成 DISC 性格测评问卷，再进入复试。"
+        }
+      ],
+      inferKnowledgeHints: async () => ({ keywords: ["DISC", "性格测评"], titleIndexes: [0] }),
+      askOpenAI: async (_question, chunks) => {
+        modelChunks = chunks;
+        return "候选人需要先完成 DISC 性格测评问卷。";
+      },
+      replyToFeishuMessage: async () => {}
+    }
+  );
+  assert.equal(result.matchedChunks, 1);
+  assert.equal(result.hintedTitles, 1);
+  assert.match(modelChunks[0].text, /DISC 性格测评/);
 });
 
 test("handles direct material request without calling the model", async () => {

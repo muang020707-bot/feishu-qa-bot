@@ -10,6 +10,7 @@ const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。�
 const NO_MATERIAL = "我在知识库里暂时没找到对应资料链接。你可以换个资料名称再问我，或把资料补充到知识库里。";
 const DEFAULT_KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
 const MESSAGE_DEDUPE_TTL_MS = 60 * 60 * 1000;
+const TITLE_CATALOG_LIMIT = 450;
 let knowledgeCache = null;
 const messageDedupeCache = new Map();
 
@@ -397,13 +398,61 @@ function extractXlsxText(buffer) {
   return rows.join("\n").trim();
 }
 
+function extractReadableStrings(buffer) {
+  const texts = [];
+  const pushClean = (value) => {
+    const clean = String(value || "")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (clean.length >= 2 && /[\u4e00-\u9fa5a-zA-Z0-9]/.test(clean)) texts.push(clean);
+  };
+
+  let ascii = "";
+  for (const byte of buffer) {
+    if (byte >= 32 && byte <= 126) {
+      ascii += String.fromCharCode(byte);
+    } else {
+      if (ascii.length >= 4) pushClean(ascii);
+      ascii = "";
+    }
+  }
+  if (ascii.length >= 4) pushClean(ascii);
+
+  let utf16 = "";
+  for (let index = 0; index + 1 < buffer.length; index += 2) {
+    const code = buffer.readUInt16LE(index);
+    if ((code >= 0x4e00 && code <= 0x9fa5) || (code >= 32 && code <= 126) || code === 0x3000 || code === 0xff0c || code === 0x3002) {
+      utf16 += String.fromCharCode(code);
+    } else {
+      if (utf16.length >= 2) pushClean(utf16);
+      utf16 = "";
+    }
+  }
+  if (utf16.length >= 2) pushClean(utf16);
+
+  const seen = new Set();
+  return texts
+    .filter((text) => {
+      if (seen.has(text)) return false;
+      seen.add(text);
+      return true;
+    })
+    .join("\n")
+    .slice(0, 20000);
+}
+
+function extractLegacyDocText(buffer) {
+  return extractReadableStrings(buffer);
+}
+
 function getFileExtension(name) {
   const match = String(name || "").toLowerCase().match(/\.([a-z0-9]+)$/);
   return match ? match[1] : "";
 }
 
 function canExtractDriveFile(fileExtension) {
-  return fileExtension === "docx" || fileExtension === "xlsx";
+  return fileExtension === "docx" || fileExtension === "xlsx" || fileExtension === "doc";
 }
 
 async function loadDriveFileContent(file, tenantAccessToken, deps = {}) {
@@ -411,6 +460,7 @@ async function loadDriveFileContent(file, tenantAccessToken, deps = {}) {
   const buffer = await (deps.downloadDriveFile || downloadDriveFile)(file.fileToken, tenantAccessToken);
   if (file.fileExtension === "docx") return (deps.extractDocxText || extractDocxText)(buffer);
   if (file.fileExtension === "xlsx") return (deps.extractXlsxText || extractXlsxText)(buffer);
+  if (file.fileExtension === "doc") return (deps.extractLegacyDocText || extractLegacyDocText)(buffer);
   return "";
 }
 
@@ -579,6 +629,41 @@ const QUERY_EXPANSIONS = [
   }
 ];
 
+async function inferKnowledgeHints(question, docs, config, deps = {}) {
+  if (!config.openaiApiKey || !docs.length) return { keywords: [], titleIndexes: [] };
+  const catalog = docs.slice(0, TITLE_CATALOG_LIMIT).map((doc, index) => `${index + 1}. ${doc.title}`).join("\n");
+  const data = await (deps.jsonRequest || jsonRequest)("POST", `${config.openaiBaseUrl || DEFAULT_LLM_BASE_URL}/chat/completions`, {
+    headers: { Authorization: `Bearer ${config.openaiApiKey}` },
+    timeoutMs: 20000,
+    body: {
+      model: config.openaiModel || DEFAULT_MODEL,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: "你是企业知识库检索助手。根据用户问题和资料标题目录，找出最可能相关的资料序号和检索关键词。只输出 JSON，不要解释。"
+        },
+        {
+          role: "user",
+          content: `用户问题：${question}\n\n资料标题目录：\n${catalog}\n\n请输出：{\"keywords\":[\"关键词1\"],\"titleIndexes\":[1,2,3]}。关键词最多12个，序号最多8个。`
+        }
+      ]
+    }
+  });
+  try {
+    const raw = extractModelText(data).replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(raw);
+    return {
+      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.map(String).filter(Boolean).slice(0, 12) : [],
+      titleIndexes: Array.isArray(parsed.titleIndexes)
+        ? parsed.titleIndexes.map((item) => Number(item) - 1).filter((item) => Number.isInteger(item) && item >= 0 && item < docs.length).slice(0, 8)
+        : []
+    };
+  } catch (_) {
+    return { keywords: [], titleIndexes: [] };
+  }
+}
+
 function tokenize(text) {
   const lower = String(text || "").toLowerCase();
   const words = lower.match(/[a-z0-9]+|[\u4e00-\u9fa5]{1,4}/g) || [];
@@ -594,6 +679,11 @@ function expandQueryTokens(question) {
     }
   }
   return [...tokens].filter(Boolean);
+}
+
+function withRetrievalHints(question, hints = {}) {
+  const keywords = Array.isArray(hints.keywords) ? hints.keywords.join(" ") : "";
+  return [question, keywords].filter(Boolean).join(" ");
 }
 
 function chunkDocument(doc, maxChars = 900) {
@@ -639,6 +729,21 @@ function retrieveRelevantChunks(question, docs, limit = 6) {
     .filter((chunk) => chunk.score > 0)
     .sort((a, b) => b.score - a.score || b.text.length - a.text.length)
     .slice(0, limit);
+}
+
+function mergeHintedDocsIntoChunks(chunks, docs, hints = {}, limit = 6) {
+  const seen = new Set(chunks.map((chunk) => `${chunk.title}\n${chunk.url}`));
+  const hinted = [];
+  for (const index of hints.titleIndexes || []) {
+    const doc = docs[index];
+    if (!doc) continue;
+    const key = `${doc.title}\n${doc.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    hinted.push({ ...doc, text: doc.content || doc.title, score: 1000 });
+    if (hinted.length >= limit) break;
+  }
+  return [...hinted, ...chunks].slice(0, limit);
 }
 
 async function hydrateRelevantChunks(question, chunks, tenantAccessToken, deps = {}, limit = 4) {
@@ -696,13 +801,18 @@ function normalizeMaterialQuery(question) {
 
 function findKnowledgeMaterials(question, docs, limit = 5) {
   const query = normalizeMaterialQuery(question) || String(question || "").trim();
+  return findKnowledgeMaterialsWithHints(query, docs, {}, limit);
+}
+
+function findKnowledgeMaterialsWithHints(question, docs, hints = {}, limit = 5) {
+  const query = normalizeMaterialQuery(question) || String(question || "").trim();
   const qTokens = expandQueryTokens(query);
   const candidates = docs.filter((doc) => doc && doc.url && doc.title);
 
-  if (!qTokens.length) return candidates.slice(0, limit);
+  if (!qTokens.length && !(hints.titleIndexes || []).length && !(hints.keywords || []).length) return candidates.slice(0, limit);
 
-  return candidates
-    .map((doc) => {
+  const ranked = candidates
+    .map((doc, index) => {
       const title = String(doc.title || "").toLowerCase();
       const content = String(doc.content || "").toLowerCase();
       const queryLower = query.toLowerCase();
@@ -711,11 +821,19 @@ function findKnowledgeMaterials(question, docs, limit = 5) {
         if (title.includes(token)) score += 5;
         if (content.includes(token)) score += 1;
       }
+      if ((hints.titleIndexes || []).includes(index)) score += 40;
+      for (const keyword of hints.keywords || []) {
+        const token = String(keyword || "").toLowerCase();
+        if (!token) continue;
+        if (title.includes(token)) score += 6;
+        if (content.includes(token)) score += 1;
+      }
       return { title: doc.title, url: doc.url, score };
     })
     .filter((doc) => doc.score > 0)
     .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title, "zh-Hans-CN"))
     .slice(0, limit);
+  return ranked;
 }
 
 function formatKnowledgeMaterialsReply(materials) {
@@ -877,21 +995,33 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
     const docs = await (deps.loadKnowledgeDocuments || loadKnowledgeDocuments)(config, { ...deps, tenantAccessToken });
 
     if (isKnowledgeMaterialRequest(question)) {
-      const materials = findKnowledgeMaterials(question, docs);
+      let materials = findKnowledgeMaterials(question, docs);
+      let hints = { keywords: [], titleIndexes: [] };
+      if (!materials.length) {
+        hints = await (deps.inferKnowledgeHints || inferKnowledgeHints)(question, docs, config, deps);
+        materials = findKnowledgeMaterialsWithHints(question, docs, hints);
+      }
       const reply = formatKnowledgeMaterialsReply(materials);
       await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, reply, tenantAccessToken);
-      return { ignored: false, question, materialMatches: materials.length };
+      return { ignored: false, question, materialMatches: materials.length, hintedTitles: hints.titleIndexes.length };
     }
 
+    let hints = { keywords: [], titleIndexes: [] };
+    let relevantChunks = retrieveRelevantChunks(question, docs);
+    if (!relevantChunks.length) {
+      hints = await (deps.inferKnowledgeHints || inferKnowledgeHints)(question, docs, config, deps);
+      const hintedQuestion = withRetrievalHints(question, hints);
+      relevantChunks = mergeHintedDocsIntoChunks(retrieveRelevantChunks(hintedQuestion, docs), docs, hints);
+    }
     const chunks = await (deps.hydrateRelevantChunks || hydrateRelevantChunks)(
       question,
-      retrieveRelevantChunks(question, docs),
+      relevantChunks,
       tenantAccessToken,
       deps
     );
     const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
     await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, formatAnswerWithSources(answer, chunks), tenantAccessToken);
-    return { ignored: false, question, matchedChunks: chunks.length };
+    return { ignored: false, question, matchedChunks: chunks.length, hintedTitles: hints.titleIndexes.length };
   } catch (error) {
     if (!deps.disableMessageDedupe) messageDedupeCache.delete(message.message_id);
     throw error;
@@ -915,6 +1045,9 @@ module.exports.shouldReplyToEvent = shouldReplyToEvent;
 module.exports.normalizeQuestion = normalizeQuestion;
 module.exports.extractFeishuLink = extractFeishuLink;
 module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
+module.exports.inferKnowledgeHints = inferKnowledgeHints;
+module.exports.findKnowledgeMaterialsWithHints = findKnowledgeMaterialsWithHints;
+module.exports.mergeHintedDocsIntoChunks = mergeHintedDocsIntoChunks;
 module.exports.hydrateRelevantChunks = hydrateRelevantChunks;
 module.exports.isKnowledgeMaterialRequest = isKnowledgeMaterialRequest;
 module.exports.findKnowledgeMaterials = findKnowledgeMaterials;
@@ -930,6 +1063,7 @@ module.exports.clearKnowledgeCache = clearKnowledgeCache;
 module.exports.getConfig = getConfig;
 module.exports.extractDocxText = extractDocxText;
 module.exports.extractXlsxText = extractXlsxText;
+module.exports.extractLegacyDocText = extractLegacyDocText;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;
