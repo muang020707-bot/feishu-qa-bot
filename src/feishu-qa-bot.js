@@ -8,7 +8,9 @@ const DEFAULT_MODEL = "qwen-plus";
 const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。建议联系对应负责人确认，或把正确文档链接补充到知识库后再问我。";
 const NO_MATERIAL = "我在知识库里暂时没找到对应资料链接。你可以换个资料名称再问我，或把资料补充到知识库里。";
 const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
+const MESSAGE_DEDUPE_TTL_MS = 60 * 60 * 1000;
 let knowledgeCache = null;
+const messageDedupeCache = new Map();
 
 function getEnv(name, fallback = "") {
   return process.env[name] || fallback;
@@ -117,6 +119,19 @@ function normalizeQuestion(event, botOpenId) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanupMessageDedupeCache(now = Date.now()) {
+  for (const [messageId, timestamp] of messageDedupeCache.entries()) {
+    if (now - timestamp > MESSAGE_DEDUPE_TTL_MS) messageDedupeCache.delete(messageId);
+  }
+}
+
+function claimMessageForProcessing(messageId, now = Date.now()) {
+  cleanupMessageDedupeCache(now);
+  if (messageDedupeCache.has(messageId)) return false;
+  messageDedupeCache.set(messageId, now);
+  return true;
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -419,6 +434,34 @@ async function replyToFeishuMessage(messageId, text, tenantAccessToken) {
   return data;
 }
 
+async function listRecentChatMessages(chatId, tenantAccessToken, limit = 50) {
+  const params = new URLSearchParams({
+    container_id: chatId,
+    container_id_type: "chat",
+    page_size: String(limit),
+    sort_type: "ByCreateTimeDesc"
+  });
+  const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/im/v1/messages?${params}`, {
+    headers: { Authorization: `Bearer ${tenantAccessToken}` }
+  });
+  if (data.code !== 0) throw new Error(`Feishu messages list error: ${data.msg || data.code}`);
+  return (data.data && data.data.items) || [];
+}
+
+async function hasExistingBotReply(message, config, tenantAccessToken, deps = {}) {
+  if (!message.chat_id || !message.message_id || !config.feishuAppId) return false;
+  const messages = await (deps.listRecentChatMessages || listRecentChatMessages)(message.chat_id, tenantAccessToken);
+  return messages.some((item) => {
+    const sender = item.sender || {};
+    return (
+      !item.deleted &&
+      (item.parent_id === message.message_id || item.root_id === message.message_id) &&
+      sender.sender_type === "app" &&
+      sender.id === config.feishuAppId
+    );
+  });
+}
+
 function getConfig() {
   return {
     openaiApiKey: getEnv("DASHSCOPE_API_KEY") || getEnv("OPENAI_API_KEY"),
@@ -438,21 +481,36 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
 
   const question = normalizeQuestion(event, config.botOpenId);
   if (!question) return { ignored: true, reason: "empty_question" };
-
-  const tenantAccessToken = deps.tenantAccessToken || (await (deps.getTenantAccessToken || getTenantAccessToken)(config));
-  const docs = await (deps.loadKnowledgeDocuments || loadKnowledgeDocuments)(config, { ...deps, tenantAccessToken });
-
-  if (isKnowledgeMaterialRequest(question)) {
-    const materials = findKnowledgeMaterials(question, docs);
-    const reply = formatKnowledgeMaterialsReply(materials);
-    await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, reply, tenantAccessToken);
-    return { ignored: false, question, materialMatches: materials.length };
+  if (/不用回答|不要回答|别回答|停止回答|取消回答/.test(question)) {
+    return { ignored: true, reason: "cancel_request", question };
+  }
+  if (!deps.disableMessageDedupe && !(deps.claimMessageForProcessing || claimMessageForProcessing)(message.message_id)) {
+    return { ignored: true, reason: "duplicate_in_memory", question };
   }
 
-  const chunks = retrieveRelevantChunks(question, docs);
-  const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
-  await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, answer, tenantAccessToken);
-  return { ignored: false, question, matchedChunks: chunks.length };
+  try {
+    const tenantAccessToken = deps.tenantAccessToken || (await (deps.getTenantAccessToken || getTenantAccessToken)(config));
+    if (await (deps.hasExistingBotReply || hasExistingBotReply)(message, config, tenantAccessToken, deps)) {
+      return { ignored: true, reason: "already_replied", question };
+    }
+
+    const docs = await (deps.loadKnowledgeDocuments || loadKnowledgeDocuments)(config, { ...deps, tenantAccessToken });
+
+    if (isKnowledgeMaterialRequest(question)) {
+      const materials = findKnowledgeMaterials(question, docs);
+      const reply = formatKnowledgeMaterialsReply(materials);
+      await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, reply, tenantAccessToken);
+      return { ignored: false, question, materialMatches: materials.length };
+    }
+
+    const chunks = retrieveRelevantChunks(question, docs);
+    const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
+    await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, answer, tenantAccessToken);
+    return { ignored: false, question, matchedChunks: chunks.length };
+  } catch (error) {
+    if (!deps.disableMessageDedupe) messageDedupeCache.delete(message.message_id);
+    throw error;
+  }
 }
 
 async function cloudFunction(params, context, logger) {
@@ -478,6 +536,8 @@ module.exports.formatKnowledgeMaterialsReply = formatKnowledgeMaterialsReply;
 module.exports.loadFolderDocuments = loadFolderDocuments;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
 module.exports.getWikiNode = getWikiNode;
+module.exports.claimMessageForProcessing = claimMessageForProcessing;
+module.exports.hasExistingBotReply = hasExistingBotReply;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;

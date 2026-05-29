@@ -4,11 +4,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const bot = require("../src/feishu-qa-bot");
 
-function event(text, mentions = []) {
+let eventCounter = 0;
+
+function event(text, mentions = [], overrides = {}) {
+  eventCounter += 1;
   return {
     event: {
       message: {
-        message_id: "om_test",
+        message_id: overrides.message_id || `om_test_${eventCounter}`,
+        chat_id: overrides.chat_id,
         content: JSON.stringify({ text }),
         mentions
       }
@@ -242,6 +246,75 @@ test("handles direct material request without calling the model", async () => {
   assert.equal(modelCalled, false);
   assert.match(replied, /劳动合同模板/);
   assert.match(replied, /https:\/\/example\.feishu\.cn\/docx\/contract/);
+});
+
+test("ignores duplicate message events in memory", async () => {
+  let replyCount = 0;
+  const duplicateEvent = event(
+    "@_user_1 公司考勤是怎么样的",
+    [{ key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }],
+    { message_id: "om_duplicate", chat_id: "oc_test" }
+  );
+  const deps = {
+    tenantAccessToken: "tenant-token",
+    hasExistingBotReply: async () => false,
+    loadKnowledgeDocuments: async () => [
+      {
+        title: "员工手册",
+        url: "https://example.feishu.cn/docx/doc123",
+        content: "公司工作时间 9:00-18:00，上下班需要打卡。"
+      }
+    ],
+    askOpenAI: async () => "公司工作时间 9:00-18:00，上下班需要打卡。",
+    replyToFeishuMessage: async () => {
+      replyCount += 1;
+    }
+  };
+  const first = await bot.handleFeishuEvent(duplicateEvent, { botOpenId: "ou_bot", feishuAppId: "cli_bot" }, deps);
+  const second = await bot.handleFeishuEvent(duplicateEvent, { botOpenId: "ou_bot", feishuAppId: "cli_bot" }, deps);
+
+  assert.equal(first.ignored, false);
+  assert.equal(second.ignored, true);
+  assert.equal(second.reason, "duplicate_in_memory");
+  assert.equal(replyCount, 1);
+});
+
+test("does not reply when a bot reply already exists", async () => {
+  let replied = false;
+  const result = await bot.handleFeishuEvent(
+    event(
+      "@_user_1 公司考勤是怎么样的",
+      [{ key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }],
+      { chat_id: "oc_test" }
+    ),
+    { botOpenId: "ou_bot", feishuAppId: "cli_bot" },
+    {
+      tenantAccessToken: "tenant-token",
+      hasExistingBotReply: async () => true,
+      replyToFeishuMessage: async () => {
+        replied = true;
+      }
+    }
+  );
+  assert.equal(result.ignored, true);
+  assert.equal(result.reason, "already_replied");
+  assert.equal(replied, false);
+});
+
+test("ignores explicit cancel requests without replying", async () => {
+  let replied = false;
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 可以不用回答了", [{ key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }]),
+    { botOpenId: "ou_bot" },
+    {
+      replyToFeishuMessage: async () => {
+        replied = true;
+      }
+    }
+  );
+  assert.equal(result.ignored, true);
+  assert.equal(result.reason, "cancel_request");
+  assert.equal(replied, false);
 });
 
 test("extracts text from OpenAI-compatible chat completions", () => {
