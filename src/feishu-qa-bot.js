@@ -130,8 +130,7 @@ async function getTenantAccessToken(config) {
 async function listFolderFiles(folderToken, tenantAccessToken) {
   const params = new URLSearchParams({
     folder_token: folderToken,
-    page_size: "100",
-    option: "get_all_children_unsort"
+    page_size: "100"
   });
   const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files?${params}`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` }
