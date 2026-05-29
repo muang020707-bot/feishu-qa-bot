@@ -92,6 +92,36 @@ test("finds knowledge materials by title and returns links", () => {
   assert.match(bot.formatKnowledgeMaterialsReply(materials), /https:\/\/example\.feishu\.cn\/docx\/contract/);
 });
 
+test("recognizes knowledge refresh requests", () => {
+  assert.equal(bot.isRefreshKnowledgeRequest("刷新知识库"), true);
+  assert.equal(bot.isRefreshKnowledgeRequest("知识库更新"), true);
+  assert.equal(bot.isRefreshKnowledgeRequest("刷新一下知识库"), false);
+});
+
+test("appends source documents to supported answers", () => {
+  const answer = bot.formatAnswerWithSources("签名时先下载电子营业执照。", [
+    {
+      title: "电子营业执照进行签名操作指引",
+      url: "https://example.feishu.cn/docx/license",
+      text: "下载电子营业执照"
+    }
+  ]);
+  assert.match(answer, /依据文档/);
+  assert.match(answer, /电子营业执照进行签名操作指引/);
+  assert.match(answer, /https:\/\/example\.feishu\.cn\/docx\/license/);
+});
+
+test("does not append source documents to unsupported answers", () => {
+  const answer = bot.formatAnswerWithSources("知识库暂无明确答案。", [
+    {
+      title: "员工手册",
+      url: "https://example.feishu.cn/docx/handbook",
+      text: "考勤"
+    }
+  ]);
+  assert.equal(answer, "知识库暂无明确答案。");
+});
+
 test("recognizes wiki knowledge source links", () => {
   const link = bot.extractFeishuLink("https://vcnh0ynuo3yd.feishu.cn/wiki/G5vLwatTWisiuGkrVITcgompnod?fromScene=spaceOverview");
   assert.deepEqual(link, {
@@ -315,6 +345,52 @@ test("ignores explicit cancel requests without replying", async () => {
   assert.equal(result.ignored, true);
   assert.equal(result.reason, "cancel_request");
   assert.equal(replied, false);
+});
+
+test("refreshes knowledge cache without loading documents", async () => {
+  let replied = "";
+  let cleared = false;
+  let loaded = false;
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 刷新知识库", [{ key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }], { chat_id: "oc_test" }),
+    { botOpenId: "ou_bot", feishuAppId: "cli_bot", knowledgeCacheTtlMs: 600000 },
+    {
+      tenantAccessToken: "tenant-token",
+      hasExistingBotReply: async () => false,
+      clearKnowledgeCache: () => {
+        cleared = true;
+      },
+      loadKnowledgeDocuments: async () => {
+        loaded = true;
+        return [];
+      },
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.refreshed, true);
+  assert.equal(cleared, true);
+  assert.equal(loaded, false);
+  assert.match(replied, /知识库缓存已刷新/);
+});
+
+test("empty cache ttl config falls back to default cache window", async () => {
+  let replied = "";
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 刷新知识库", [{ key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }], { chat_id: "oc_test" }),
+    { botOpenId: "ou_bot", feishuAppId: "cli_bot", knowledgeCacheTtlMs: "" },
+    {
+      tenantAccessToken: "tenant-token",
+      hasExistingBotReply: async () => false,
+      clearKnowledgeCache: () => {},
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.refreshed, true);
+  assert.match(replied, /10 分钟/);
 });
 
 test("extracts text from OpenAI-compatible chat completions", () => {

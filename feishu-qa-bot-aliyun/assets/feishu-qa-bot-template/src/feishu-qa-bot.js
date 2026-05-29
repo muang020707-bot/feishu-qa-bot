@@ -7,7 +7,7 @@ const DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 const DEFAULT_MODEL = "qwen-plus";
 const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。建议联系对应负责人确认，或把正确文档链接补充到知识库后再问我。";
 const NO_MATERIAL = "我在知识库里暂时没找到对应资料链接。你可以换个资料名称再问我，或把资料补充到知识库里。";
-const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
 const MESSAGE_DEDUPE_TTL_MS = 60 * 60 * 1000;
 let knowledgeCache = null;
 const messageDedupeCache = new Map();
@@ -21,6 +21,19 @@ function splitCsv(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function getKnowledgeCacheTtlMs(config = {}) {
+  const rawValue = config.knowledgeCacheTtlMs !== undefined && config.knowledgeCacheTtlMs !== null && config.knowledgeCacheTtlMs !== ""
+    ? config.knowledgeCacheTtlMs
+    : getEnv("KNOWLEDGE_CACHE_TTL_MS");
+  if (rawValue === undefined || rawValue === null || rawValue === "") return DEFAULT_KNOWLEDGE_CACHE_TTL_MS;
+  const raw = Number(rawValue);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_KNOWLEDGE_CACHE_TTL_MS;
+}
+
+function clearKnowledgeCache() {
+  knowledgeCache = null;
 }
 
 function jsonRequest(method, url, { headers = {}, body, timeoutMs = 30000 } = {}) {
@@ -266,7 +279,8 @@ async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceU
 
 async function loadKnowledgeDocuments(config, deps = {}) {
   const cacheKey = config.knowledgeSourceUrls || "";
-  if (!deps.disableCache && knowledgeCache && knowledgeCache.key === cacheKey && Date.now() - knowledgeCache.loadedAt < KNOWLEDGE_CACHE_TTL_MS) {
+  const cacheTtlMs = getKnowledgeCacheTtlMs(config);
+  if (!deps.disableCache && cacheTtlMs > 0 && knowledgeCache && knowledgeCache.key === cacheKey && Date.now() - knowledgeCache.loadedAt < cacheTtlMs) {
     return knowledgeCache.docs;
   }
 
@@ -343,6 +357,11 @@ function isKnowledgeMaterialRequest(question) {
   return /(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{0,12}(合同|手册|制度|表格|表单|流程|规定|清单)/.test(text);
 }
 
+function isRefreshKnowledgeRequest(question) {
+  const text = String(question || "").replace(/\s+/g, "");
+  return /^(刷新|更新|重载|重新加载|清空缓存)(知识库|资料|文档库)?$/.test(text) || /^(知识库|资料|文档库)(刷新|更新|重载|重新加载)$/.test(text);
+}
+
 function normalizeMaterialQuery(question) {
   return String(question || "")
     .replace(/(麻烦|请|帮我|帮忙|给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开|下载|一下|看看|看下|相关|对应|这个|那个|的)/g, " ")
@@ -385,6 +404,32 @@ function formatKnowledgeMaterialsReply(materials) {
   return lines.join("\n");
 }
 
+function answerLooksUnsupported(answer) {
+  return /知识库(里)?暂无|没有找到|没有明确/.test(String(answer || ""));
+}
+
+function formatAnswerWithSources(answer, chunks, limit = 3) {
+  if (!chunks.length || answerLooksUnsupported(answer)) return answer;
+
+  const sources = [];
+  const seen = new Set();
+  for (const chunk of chunks) {
+    const key = `${chunk.title}\n${chunk.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sources.push({ title: chunk.title, url: chunk.url });
+    if (sources.length >= limit) break;
+  }
+  if (!sources.length) return answer;
+
+  const lines = ["", "依据文档："];
+  sources.forEach((source, index) => {
+    lines.push(`${index + 1}. ${source.title}`);
+    lines.push(source.url);
+  });
+  return `${answer.trim()}\n${lines.join("\n")}`;
+}
+
 async function askOpenAI(question, chunks, config) {
   if (!chunks.length) return NO_ANSWER;
   const context = chunks
@@ -397,7 +442,7 @@ async function askOpenAI(question, chunks, config) {
       messages: [
         {
           role: "system",
-          content: "你是公司内部飞书问答机器人。只基于提供的资料回答。资料没有明确依据时，回复知识库暂无明确答案，不要编造制度、薪资、合同、审批结论。回答要简洁、中文。"
+          content: "你是公司内部飞书问答机器人。必须只基于提供的资料回答。资料没有明确依据时，只回复知识库暂无明确答案，不要编造制度、薪资、合同、审批结论。回答要简洁、中文。"
         },
         {
           role: "user",
@@ -470,7 +515,8 @@ function getConfig() {
     feishuAppSecret: getEnv("FEISHU_APP_SECRET"),
     botOpenId: getEnv("BOT_OPEN_ID"),
     knowledgeSourceUrls: getEnv("KNOWLEDGE_SOURCE_URLS"),
-    openaiModel: getEnv("OPENAI_MODEL", DEFAULT_MODEL)
+    openaiModel: getEnv("OPENAI_MODEL", DEFAULT_MODEL),
+    knowledgeCacheTtlMs: getEnv("KNOWLEDGE_CACHE_TTL_MS")
   };
 }
 
@@ -494,6 +540,16 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
       return { ignored: true, reason: "already_replied", question };
     }
 
+    if (isRefreshKnowledgeRequest(question)) {
+      (deps.clearKnowledgeCache || clearKnowledgeCache)();
+      const minutes = Math.round(getKnowledgeCacheTtlMs(config) / 60000);
+      const refreshText = minutes > 0
+        ? `知识库缓存已刷新。下一条问题会重新读取飞书云盘资料；平时资料更新后最多约 ${minutes} 分钟自动生效。`
+        : "知识库缓存已刷新。当前配置为不缓存，每次都会重新读取飞书云盘资料。";
+      await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, refreshText, tenantAccessToken);
+      return { ignored: false, question, refreshed: true };
+    }
+
     const docs = await (deps.loadKnowledgeDocuments || loadKnowledgeDocuments)(config, { ...deps, tenantAccessToken });
 
     if (isKnowledgeMaterialRequest(question)) {
@@ -505,7 +561,7 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
 
     const chunks = retrieveRelevantChunks(question, docs);
     const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
-    await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, answer, tenantAccessToken);
+    await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, formatAnswerWithSources(answer, chunks), tenantAccessToken);
     return { ignored: false, question, matchedChunks: chunks.length };
   } catch (error) {
     if (!deps.disableMessageDedupe) messageDedupeCache.delete(message.message_id);
@@ -533,11 +589,14 @@ module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
 module.exports.isKnowledgeMaterialRequest = isKnowledgeMaterialRequest;
 module.exports.findKnowledgeMaterials = findKnowledgeMaterials;
 module.exports.formatKnowledgeMaterialsReply = formatKnowledgeMaterialsReply;
+module.exports.isRefreshKnowledgeRequest = isRefreshKnowledgeRequest;
+module.exports.formatAnswerWithSources = formatAnswerWithSources;
 module.exports.loadFolderDocuments = loadFolderDocuments;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
 module.exports.getWikiNode = getWikiNode;
 module.exports.claimMessageForProcessing = claimMessageForProcessing;
 module.exports.hasExistingBotReply = hasExistingBotReply;
+module.exports.clearKnowledgeCache = clearKnowledgeCache;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;
