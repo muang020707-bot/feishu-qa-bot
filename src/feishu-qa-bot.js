@@ -6,6 +6,7 @@ const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
 const DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_MODEL = "qwen-plus";
 const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。建议联系对应负责人确认，或把正确文档链接补充到知识库后再问我。";
+const NO_MATERIAL = "我在知识库里暂时没找到对应资料链接。你可以换个资料名称再问我，或把资料补充到知识库里。";
 const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
 let knowledgeCache = null;
 
@@ -284,6 +285,55 @@ function retrieveRelevantChunks(question, docs, limit = 6) {
     .slice(0, limit);
 }
 
+function isKnowledgeMaterialRequest(question) {
+  const text = String(question || "").replace(/\s+/g, "");
+  if (!text) return false;
+  if (/(资料|文档|文件|附件|链接|下载|原文|模板)/.test(text)) return true;
+  return /(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{0,12}(合同|手册|制度|表格|表单|流程|规定|清单)/.test(text);
+}
+
+function normalizeMaterialQuery(question) {
+  return String(question || "")
+    .replace(/(麻烦|请|帮我|帮忙|给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开|下载|一下|看看|看下|相关|对应|这个|那个|的)/g, " ")
+    .replace(/(资料|文档|文件|附件|链接|原文|模板)/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findKnowledgeMaterials(question, docs, limit = 5) {
+  const query = normalizeMaterialQuery(question) || String(question || "").trim();
+  const qTokens = tokenize(query);
+  const candidates = docs.filter((doc) => doc && doc.url && doc.title);
+
+  if (!qTokens.length) return candidates.slice(0, limit);
+
+  return candidates
+    .map((doc) => {
+      const title = String(doc.title || "").toLowerCase();
+      const content = String(doc.content || "").toLowerCase();
+      const queryLower = query.toLowerCase();
+      let score = title.includes(queryLower) ? 12 : 0;
+      for (const token of qTokens) {
+        if (title.includes(token)) score += 5;
+        if (content.includes(token)) score += 1;
+      }
+      return { title: doc.title, url: doc.url, score };
+    })
+    .filter((doc) => doc.score > 0)
+    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title, "zh-Hans-CN"))
+    .slice(0, limit);
+}
+
+function formatKnowledgeMaterialsReply(materials) {
+  if (!materials.length) return NO_MATERIAL;
+  const lines = ["找到这些资料，可以直接打开："];
+  materials.forEach((material, index) => {
+    lines.push(`${index + 1}. ${material.title}`);
+    lines.push(material.url);
+  });
+  return lines.join("\n");
+}
+
 async function askOpenAI(question, chunks, config) {
   if (!chunks.length) return NO_ANSWER;
   const context = chunks
@@ -327,7 +377,7 @@ async function replyToFeishuMessage(messageId, text, tenantAccessToken) {
   const content = JSON.stringify({ text: text.slice(0, 5000) });
   const data = await jsonRequest("POST", `${FEISHU_BASE_URL}/im/v1/messages/${messageId}/reply`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` },
-    body: { msg_type: "text", content }
+    body: { msg_type: "text", content, uuid: `reply-${messageId}` }
   });
   if (data.code !== 0) throw new Error(`Feishu reply error: ${data.msg || data.code}`);
   return data;
@@ -355,6 +405,14 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
 
   const tenantAccessToken = deps.tenantAccessToken || (await (deps.getTenantAccessToken || getTenantAccessToken)(config));
   const docs = await (deps.loadKnowledgeDocuments || loadKnowledgeDocuments)(config, { ...deps, tenantAccessToken });
+
+  if (isKnowledgeMaterialRequest(question)) {
+    const materials = findKnowledgeMaterials(question, docs);
+    const reply = formatKnowledgeMaterialsReply(materials);
+    await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, reply, tenantAccessToken);
+    return { ignored: false, question, materialMatches: materials.length };
+  }
+
   const chunks = retrieveRelevantChunks(question, docs);
   const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
   await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, answer, tenantAccessToken);
@@ -378,7 +436,11 @@ module.exports.shouldReplyToEvent = shouldReplyToEvent;
 module.exports.normalizeQuestion = normalizeQuestion;
 module.exports.extractFeishuLink = extractFeishuLink;
 module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
+module.exports.isKnowledgeMaterialRequest = isKnowledgeMaterialRequest;
+module.exports.findKnowledgeMaterials = findKnowledgeMaterials;
+module.exports.formatKnowledgeMaterialsReply = formatKnowledgeMaterialsReply;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
 module.exports.getWikiNode = getWikiNode;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
+module.exports.NO_MATERIAL = NO_MATERIAL;

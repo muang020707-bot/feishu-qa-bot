@@ -64,6 +64,30 @@ test("retrieves relevant chunks from knowledge documents", () => {
   assert.match(chunks[0].text, /考勤|工作时间|打卡/);
 });
 
+test("recognizes direct material requests", () => {
+  assert.equal(bot.isKnowledgeMaterialRequest("给我劳动合同"), true);
+  assert.equal(bot.isKnowledgeMaterialRequest("发一下员工手册文档"), true);
+  assert.equal(bot.isKnowledgeMaterialRequest("公司考勤是怎么样的"), false);
+});
+
+test("finds knowledge materials by title and returns links", () => {
+  const materials = bot.findKnowledgeMaterials("给我劳动合同", [
+    {
+      title: "员工手册",
+      url: "https://example.feishu.cn/docx/handbook",
+      content: "考勤制度"
+    },
+    {
+      title: "劳动合同模板",
+      url: "https://example.feishu.cn/docx/contract",
+      content: "劳动合同签署说明"
+    }
+  ]);
+  assert.equal(materials.length, 1);
+  assert.equal(materials[0].title, "劳动合同模板");
+  assert.match(bot.formatKnowledgeMaterialsReply(materials), /https:\/\/example\.feishu\.cn\/docx\/contract/);
+});
+
 test("recognizes wiki knowledge source links", () => {
   const link = bot.extractFeishuLink("https://vcnh0ynuo3yd.feishu.cn/wiki/G5vLwatTWisiuGkrVITcgompnod?fromScene=spaceOverview");
   assert.deepEqual(link, {
@@ -145,6 +169,43 @@ test("handles mentioned event with mocked dependencies", async () => {
   );
   assert.equal(result.ignored, false);
   assert.match(replied, /打卡/);
+});
+
+test("handles direct material request without calling the model", async () => {
+  let replied = "";
+  let modelCalled = false;
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 给我劳动合同", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/docx/doc123",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "劳动合同模板",
+          url: "https://example.feishu.cn/docx/contract",
+          content: "劳动合同签署说明"
+        }
+      ],
+      askOpenAI: async () => {
+        modelCalled = true;
+        return "should not be used";
+      },
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.ignored, false);
+  assert.equal(result.materialMatches, 1);
+  assert.equal(modelCalled, false);
+  assert.match(replied, /劳动合同模板/);
+  assert.match(replied, /https:\/\/example\.feishu\.cn\/docx\/contract/);
 });
 
 test("extracts text from OpenAI-compatible chat completions", () => {
