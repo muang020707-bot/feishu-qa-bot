@@ -698,6 +698,10 @@ const QUERY_EXPANSIONS = [
   {
     pattern: /性格|测评|测试|disc|pdp|行为风格|问卷/i,
     terms: ["DISC", "PDP", "性格", "性格测试", "性格测评", "测评问卷", "行为风格", "行为风格测试", "问卷", "黑白版"]
+  },
+  {
+    pattern: /花名册|名单|人员|员工|通讯录|人才画像/,
+    terms: ["花名册", "员工花名册", "员工名单", "人员名单", "通讯录", "人才画像", "员工信息", "人员信息"]
   }
 ];
 
@@ -739,7 +743,21 @@ async function inferKnowledgeHints(question, docs, config, deps = {}) {
 function tokenize(text) {
   const lower = String(text || "").toLowerCase();
   const words = lower.match(/[a-z0-9]+|[\u4e00-\u9fa5]{1,4}/g) || [];
-  return words.filter((word) => word.trim().length > 0 && !STOP_TOKENS.has(word));
+  const tokens = new Set();
+  for (const word of words) {
+    const trimmed = word.trim();
+    if (!trimmed || STOP_TOKENS.has(trimmed)) continue;
+    tokens.add(trimmed);
+    if (/^[\u4e00-\u9fa5]+$/.test(trimmed) && trimmed.length > 2) {
+      for (let size = 2; size <= Math.min(4, trimmed.length); size += 1) {
+        for (let index = 0; index <= trimmed.length - size; index += 1) {
+          const token = trimmed.slice(index, index + size);
+          if (!STOP_TOKENS.has(token)) tokens.add(token);
+        }
+      }
+    }
+  }
+  return [...tokens];
 }
 
 function expandQueryTokens(question) {
@@ -854,7 +872,11 @@ function isKnowledgeMaterialRequest(question) {
   if (/^(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{1,40}$/.test(text) && !/(怎么|如何|为什么|是多少|吗|？|\?)/.test(text)) {
     return true;
   }
-  return /(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{0,12}(合同|手册|制度|表格|表单|流程|规定|清单)/.test(text);
+  if (/.{1,40}(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开)$/.test(text) && !/(怎么|如何|为什么|是多少|吗|？|\?)/.test(text)) {
+    return true;
+  }
+  return /(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{0,12}(合同|手册|制度|表格|表单|流程|规定|清单|花名册|名单|通讯录|人才画像)/.test(text)
+    || /(合同|手册|制度|表格|表单|流程|规定|清单|花名册|名单|通讯录|人才画像).{0,12}(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开)/.test(text);
 }
 
 function isRefreshKnowledgeRequest(question) {
@@ -1069,7 +1091,8 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
     if (isKnowledgeMaterialRequest(question)) {
       let materials = findKnowledgeMaterials(question, docs);
       let hints = { keywords: [], titleIndexes: [] };
-      if (!materials.length) {
+      const topMaterialScore = materials.length ? Number(materials[0].score || 0) : 0;
+      if (!materials.length || topMaterialScore < 12) {
         hints = await (deps.inferKnowledgeHints || inferKnowledgeHints)(question, docs, config, deps);
         materials = findKnowledgeMaterialsWithHints(question, docs, hints);
       }

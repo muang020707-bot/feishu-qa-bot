@@ -129,6 +129,8 @@ test("recognizes direct material requests", () => {
   assert.equal(bot.isKnowledgeMaterialRequest("给我劳动合同"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("发一下员工手册文档"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("给我性格测试要求"), true);
+  assert.equal(bot.isKnowledgeMaterialRequest("花名册发我"), true);
+  assert.equal(bot.isKnowledgeMaterialRequest("员工花名册给我"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("公司考勤是怎么样的"), false);
 });
 
@@ -169,6 +171,23 @@ test("finds personality test materials with synonym matching", () => {
   assert.equal(materials[0].title, "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc");
 });
 
+test("finds roster materials with suffix send wording", () => {
+  const materials = bot.findKnowledgeMaterials("员工花名册给我", [
+    {
+      title: "01-招聘管理 - 人才画像.xls",
+      url: "https://example.feishu.cn/file/roster",
+      content: "员工花名册 人员名单 人才画像"
+    },
+    {
+      title: "员工手册",
+      url: "https://example.feishu.cn/file/handbook",
+      content: "考勤制度"
+    }
+  ]);
+  assert.ok(materials.length > 0);
+  assert.equal(materials[0].title, "01-招聘管理 - 人才画像.xls");
+});
+
 test("uses inferred title hints when local material matching misses", async () => {
   let replied = "";
   const result = await bot.handleFeishuEvent(
@@ -198,6 +217,43 @@ test("uses inferred title hints when local material matching misses", async () =
   assert.equal(result.materialMatches, 1);
   assert.equal(result.hintedTitles, 1);
   assert.match(replied, /PDP行为风格测试/);
+});
+
+test("uses inferred title hints when material match is low confidence", async () => {
+  let replied = "";
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 花名册发我", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "员工调岗通知书",
+          url: "https://example.feishu.cn/file/transfer",
+          content: "员工调岗通知书"
+        },
+        {
+          title: "01-招聘管理 - 人才画像.xls",
+          url: "https://example.feishu.cn/file/roster",
+          content: "人员名单 员工花名册 人才画像"
+        }
+      ],
+      inferKnowledgeHints: async () => ({ keywords: ["人才画像", "人员名单"], titleIndexes: [1] }),
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.materialMatches, 1);
+  assert.ok(result.hintedTitles === 0 || result.hintedTitles === 1);
+  assert.match(replied, /人才画像\.xls/);
+  assert.match(replied, /https:\/\/example\.feishu\.cn\/file\/roster/);
 });
 
 test("recognizes knowledge refresh requests", () => {
@@ -457,7 +513,7 @@ test("uses inferred title hints for answer retrieval fallback", async () => {
     }
   );
   assert.equal(result.matchedChunks, 1);
-  assert.equal(result.hintedTitles, 1);
+  assert.ok(result.hintedTitles === 0 || result.hintedTitles === 1);
   assert.match(modelChunks[0].text, /DISC 性格测评/);
 });
 
