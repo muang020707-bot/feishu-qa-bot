@@ -6,6 +6,8 @@ const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
 const DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_MODEL = "qwen-plus";
 const NO_ANSWER = "知识库里暂时没有找到这个问题的明确答案。建议联系对应负责人确认，或把正确文档链接补充到知识库后再问我。";
+const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000;
+let knowledgeCache = null;
 
 function getEnv(name, fallback = "") {
   return process.env[name] || fallback;
@@ -200,6 +202,11 @@ async function loadWikiNodeDocuments(node, tenantAccessToken, deps, sourceUrl, d
 }
 
 async function loadKnowledgeDocuments(config, deps = {}) {
+  const cacheKey = config.knowledgeSourceUrls || "";
+  if (!deps.disableCache && knowledgeCache && knowledgeCache.key === cacheKey && Date.now() - knowledgeCache.loadedAt < KNOWLEDGE_CACHE_TTL_MS) {
+    return knowledgeCache.docs;
+  }
+
   const tenantAccessToken = deps.tenantAccessToken || (await getTenantAccessToken(config));
   const sourceLinks = splitCsv(config.knowledgeSourceUrls).map(extractFeishuLink);
   const docs = [];
@@ -230,7 +237,11 @@ async function loadKnowledgeDocuments(config, deps = {}) {
     }
   }
 
-  return docs.filter((doc) => doc.content && doc.content.trim());
+  const filteredDocs = docs.filter((doc) => doc.content && doc.content.trim());
+  if (!deps.disableCache) {
+    knowledgeCache = { key: cacheKey, loadedAt: Date.now(), docs: filteredDocs };
+  }
+  return filteredDocs;
 }
 
 function tokenize(text) {
