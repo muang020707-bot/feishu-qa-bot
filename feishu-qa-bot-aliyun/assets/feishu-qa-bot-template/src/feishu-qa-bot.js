@@ -543,6 +543,7 @@ const STOP_TOKENS = new Set([
   "可以",
   "员工",
   "公司",
+  "要求",
   "一下",
   "这个",
   "那个",
@@ -571,6 +572,10 @@ const QUERY_EXPANSIONS = [
   {
     pattern: /离职|辞职|解除|交接/,
     terms: ["离职", "辞职", "解除", "交接", "离职证明", "离职协议"]
+  },
+  {
+    pattern: /性格|测评|测试|disc|pdp|行为风格|问卷/i,
+    terms: ["DISC", "PDP", "性格", "性格测试", "性格测评", "测评问卷", "行为风格", "行为风格测试", "问卷", "黑白版"]
   }
 ];
 
@@ -669,12 +674,16 @@ function isKnowledgeMaterialRequest(question) {
   const text = String(question || "").replace(/\s+/g, "");
   if (!text) return false;
   if (/(资料|文档|文件|附件|链接|下载|原文|模板)/.test(text)) return true;
+  if (/^(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{1,40}$/.test(text) && !/(怎么|如何|为什么|是多少|吗|？|\?)/.test(text)) {
+    return true;
+  }
   return /(给我|发我|发一下|发下|我要|我想要|找一下|找下|调取|发送|查看|打开).{0,12}(合同|手册|制度|表格|表单|流程|规定|清单)/.test(text);
 }
 
 function isRefreshKnowledgeRequest(question) {
   const text = String(question || "").replace(/\s+/g, "");
-  return /^(刷新|更新|重载|重新加载|清空缓存)(知识库|资料|文档库)?$/.test(text) || /^(知识库|资料|文档库)(刷新|更新|重载|重新加载)$/.test(text);
+  return /^(刷新|更新|重载|重新加载|清空缓存)(一下|下)?(知识库|资料|文档库)?$/.test(text)
+    || /^(知识库|资料|文档库)(刷新|更新|重载|重新加载)(一下|下)?$/.test(text);
 }
 
 function normalizeMaterialQuery(question) {

@@ -107,6 +107,7 @@ test("hydrates matching uploaded files before answering", async () => {
 test("recognizes direct material requests", () => {
   assert.equal(bot.isKnowledgeMaterialRequest("给我劳动合同"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("发一下员工手册文档"), true);
+  assert.equal(bot.isKnowledgeMaterialRequest("给我性格测试要求"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("公司考勤是怎么样的"), false);
 });
 
@@ -128,10 +129,30 @@ test("finds knowledge materials by title and returns links", () => {
   assert.match(bot.formatKnowledgeMaterialsReply(materials), /https:\/\/example\.feishu\.cn\/docx\/contract/);
 });
 
+test("finds personality test materials with synonym matching", () => {
+  const materials = bot.findKnowledgeMaterials("给我性格测试要求", [
+    {
+      title: "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc",
+      url: "https://example.feishu.cn/file/disc",
+      content: "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc",
+      fileToken: "file-disc",
+      fileExtension: "doc"
+    },
+    {
+      title: "01-招聘管理 - 附件1.面试登记表20201022(1).doc",
+      url: "https://example.feishu.cn/file/interview",
+      content: "面试登记表"
+    }
+  ]);
+  assert.ok(materials.length > 0);
+  assert.equal(materials[0].title, "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc");
+});
+
 test("recognizes knowledge refresh requests", () => {
   assert.equal(bot.isRefreshKnowledgeRequest("刷新知识库"), true);
+  assert.equal(bot.isRefreshKnowledgeRequest("刷新下知识库"), true);
   assert.equal(bot.isRefreshKnowledgeRequest("知识库更新"), true);
-  assert.equal(bot.isRefreshKnowledgeRequest("刷新一下知识库"), false);
+  assert.equal(bot.isRefreshKnowledgeRequest("刷新一下知识库"), true);
 });
 
 test("appends source documents to supported answers", () => {
@@ -352,6 +373,45 @@ test("handles direct material request without calling the model", async () => {
   assert.equal(modelCalled, false);
   assert.match(replied, /劳动合同模板/);
   assert.match(replied, /https:\/\/example\.feishu\.cn\/docx\/contract/);
+});
+
+test("handles loose material request without calling the model", async () => {
+  let replied = "";
+  let modelCalled = false;
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 给我性格测试要求", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc",
+          url: "https://example.feishu.cn/file/disc",
+          content: "01-招聘管理 - 2-DISC性格测评问卷-黑白版(1).doc",
+          fileToken: "file-disc",
+          fileExtension: "doc"
+        }
+      ],
+      askOpenAI: async () => {
+        modelCalled = true;
+        return "should not be used";
+      },
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.ignored, false);
+  assert.equal(result.materialMatches, 1);
+  assert.equal(modelCalled, false);
+  assert.match(replied, /DISC性格测评问卷/);
+  assert.match(replied, /https:\/\/example\.feishu\.cn\/file\/disc/);
 });
 
 test("ignores duplicate message events in memory", async () => {
