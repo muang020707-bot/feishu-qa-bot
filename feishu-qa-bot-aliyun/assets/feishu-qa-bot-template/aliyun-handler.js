@@ -59,6 +59,14 @@ function verifyFeishuToken(payload) {
   return payload && payload.token === expected;
 }
 
+function runFeishuEventInBackground(payload) {
+  setImmediate(() => {
+    handleFeishuEvent(payload).catch((error) => {
+      console.error(error);
+    });
+  });
+}
+
 exports.handler = async function handler(request, response) {
   try {
     const eventMode = !response || typeof response.setStatusCode !== "function";
@@ -90,6 +98,11 @@ exports.handler = async function handler(request, response) {
       return sendJson(response, 403, { error: "invalid token" });
     }
 
+    if (!eventMode) {
+      runFeishuEventInBackground(payload);
+      return sendJson(response, 200, { ok: true, accepted: true });
+    }
+
     const result = await handleFeishuEvent(payload);
     return sendJson(response, 200, result);
   } catch (error) {
@@ -99,3 +112,4 @@ exports.handler = async function handler(request, response) {
 };
 
 exports.verifyFeishuToken = verifyFeishuToken;
+exports.runFeishuEventInBackground = runFeishuEventInBackground;

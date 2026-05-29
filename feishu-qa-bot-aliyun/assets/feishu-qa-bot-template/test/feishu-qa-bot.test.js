@@ -2,6 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const bot = require("../src/feishu-qa-bot");
 
 let eventCounter = 0;
@@ -315,6 +318,44 @@ test("loads documents from nested drive folders", async () => {
   assert.equal(docs[0].title, "04-考勤休假 - 考勤制度");
   assert.equal(docs[0].url, "https://example.feishu.cn/docx/attendance-doc");
   assert.match(docs[0].content, /考勤制度/);
+});
+
+test("loads packaged knowledge index before remote sources", async () => {
+  const previous = process.env.KNOWLEDGE_INDEX_PATH;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-bot-index-"));
+  const indexPath = path.join(tempDir, "knowledge-index.json");
+  fs.writeFileSync(
+    indexPath,
+    JSON.stringify({
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      docs: [
+        {
+          title: "本地索引员工手册",
+          url: "https://example.feishu.cn/file/indexed",
+          content: "本地索引里的考勤制度"
+        }
+      ]
+    }),
+    "utf8"
+  );
+  process.env.KNOWLEDGE_INDEX_PATH = indexPath;
+  try {
+    const docs = await bot.loadKnowledgeDocuments(
+      { knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root" },
+      {
+        disableCache: true,
+        listFolderFiles: async () => {
+          throw new Error("should not list remote folder");
+        }
+      }
+    );
+    assert.equal(docs.length, 1);
+    assert.equal(docs[0].title, "本地索引员工手册");
+  } finally {
+    if (previous === undefined) delete process.env.KNOWLEDGE_INDEX_PATH;
+    else process.env.KNOWLEDGE_INDEX_PATH = previous;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("handles mentioned event with mocked dependencies", async () => {

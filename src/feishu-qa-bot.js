@@ -1,6 +1,8 @@
 "use strict";
 
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 const zlib = require("zlib");
 
 const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
@@ -36,6 +38,29 @@ function getKnowledgeCacheTtlMs(config = {}) {
 
 function clearKnowledgeCache() {
   knowledgeCache = null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableFeishuError(error) {
+  const message = String(error && error.message ? error.message : error);
+  return message.includes("99991400") || message.includes("frequency limit") || message.includes("Request timed out");
+}
+
+async function withFeishuRetry(operation, { attempts = 5, baseDelayMs = 1800 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableFeishuError(error) || attempt === attempts) break;
+      await sleep(baseDelayMs * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function jsonRequest(method, url, { headers = {}, body, timeoutMs = 30000 } = {}) {
@@ -233,26 +258,26 @@ async function listFolderFiles(folderToken, tenantAccessToken) {
 }
 
 async function fetchDocxRawContent(documentId, tenantAccessToken) {
-  const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/docx/v1/documents/${documentId}/raw_content`, {
+  const data = await withFeishuRetry(() => jsonRequest("GET", `${FEISHU_BASE_URL}/docx/v1/documents/${documentId}/raw_content`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` }
-  });
+  }));
   if (data.code !== 0) throw new Error(`Feishu docx raw_content error: ${data.msg || data.code}`);
   return (data.data && (data.data.content || data.data.raw_content)) || "";
 }
 
 async function fetchLegacyDocRawContent(docToken, tenantAccessToken) {
-  const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/doc/v2/${docToken}/raw_content`, {
+  const data = await withFeishuRetry(() => jsonRequest("GET", `${FEISHU_BASE_URL}/doc/v2/${docToken}/raw_content`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` }
-  });
+  }));
   if (data.code !== 0) throw new Error(`Feishu doc raw_content error: ${data.msg || data.code}`);
   return (data.data && data.data.content) || "";
 }
 
 async function downloadDriveFile(fileToken, tenantAccessToken) {
-  const data = await binaryRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files/${fileToken}/download`, {
+  const data = await withFeishuRetry(() => binaryRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files/${fileToken}/download`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` },
     timeoutMs: 45000
-  });
+  }));
   const contentType = String(data.headers["content-type"] || "");
   if (contentType.includes("application/json")) {
     const payload = JSON.parse(data.buffer.toString("utf8") || "{}");
@@ -398,6 +423,18 @@ function extractXlsxText(buffer) {
   return rows.join("\n").trim();
 }
 
+function extractZipXmlText(buffer, patterns) {
+  return listZipEntries(buffer)
+    .filter((name) => patterns.some((pattern) => pattern.test(name)))
+    .map((entry) => {
+      const xml = findZipEntry(buffer, entry);
+      return xml ? xmlToText(xml.toString("utf8")) : "";
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
 function extractReadableStrings(buffer) {
   const texts = [];
   const pushClean = (value) => {
@@ -446,13 +483,17 @@ function extractLegacyDocText(buffer) {
   return extractReadableStrings(buffer);
 }
 
+function extractPlainText(buffer) {
+  return buffer.toString("utf8").replace(/\u0000/g, "").trim() || extractReadableStrings(buffer);
+}
+
 function getFileExtension(name) {
   const match = String(name || "").toLowerCase().match(/\.([a-z0-9]+)$/);
   return match ? match[1] : "";
 }
 
 function canExtractDriveFile(fileExtension) {
-  return fileExtension === "docx" || fileExtension === "xlsx" || fileExtension === "doc";
+  return ["docx", "xlsx", "doc", "xls", "pptx", "pdf", "txt", "csv"].includes(fileExtension);
 }
 
 async function loadDriveFileContent(file, tenantAccessToken, deps = {}) {
@@ -461,6 +502,9 @@ async function loadDriveFileContent(file, tenantAccessToken, deps = {}) {
   if (file.fileExtension === "docx") return (deps.extractDocxText || extractDocxText)(buffer);
   if (file.fileExtension === "xlsx") return (deps.extractXlsxText || extractXlsxText)(buffer);
   if (file.fileExtension === "doc") return (deps.extractLegacyDocText || extractLegacyDocText)(buffer);
+  if (file.fileExtension === "xls" || file.fileExtension === "pdf") return (deps.extractReadableStrings || extractReadableStrings)(buffer);
+  if (file.fileExtension === "pptx") return (deps.extractZipXmlText || extractZipXmlText)(buffer, [/^ppt\/slides\/slide\d+\.xml$/, /^ppt\/notesSlides\/notesSlide\d+\.xml$/]);
+  if (file.fileExtension === "txt" || file.fileExtension === "csv") return (deps.extractPlainText || extractPlainText)(buffer);
   return "";
 }
 
@@ -536,7 +580,7 @@ async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceU
     }
   }
 
-  const loadedDocuments = await mapLimit(documentFiles, 3, async (file) => {
+  const loadedDocuments = await mapLimit(documentFiles, 1, async (file) => {
     if (file.targetType === "docx") {
       const content = await (deps.fetchDocxRawContent || fetchDocxRawContent)(file.targetToken, tenantAccessToken);
       return { title: file.title, url: file.url, content };
@@ -554,6 +598,16 @@ async function loadKnowledgeDocuments(config, deps = {}) {
   const cacheTtlMs = getKnowledgeCacheTtlMs(config);
   if (!deps.disableCache && cacheTtlMs > 0 && knowledgeCache && knowledgeCache.key === cacheKey && Date.now() - knowledgeCache.loadedAt < cacheTtlMs) {
     return knowledgeCache.docs;
+  }
+
+  if (!deps.disablePackagedIndex) {
+    const packagedDocs = loadPackagedKnowledgeIndex(config);
+    if (packagedDocs.length) {
+      if (!deps.disableCache) {
+        knowledgeCache = { key: cacheKey, loadedAt: Date.now(), docs: packagedDocs };
+      }
+      return packagedDocs;
+    }
   }
 
   const tenantAccessToken = deps.tenantAccessToken || (await getTenantAccessToken(config));
@@ -580,6 +634,24 @@ async function loadKnowledgeDocuments(config, deps = {}) {
     knowledgeCache = { key: cacheKey, loadedAt: Date.now(), docs: filteredDocs };
   }
   return filteredDocs;
+}
+
+function packagedIndexPath() {
+  return getEnv("KNOWLEDGE_INDEX_PATH") || path.join(__dirname, "..", "knowledge-index.json");
+}
+
+function loadPackagedKnowledgeIndex(config = {}) {
+  const indexPath = packagedIndexPath();
+  if (!fs.existsSync(indexPath)) return [];
+  try {
+    const payload = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+    const docs = Array.isArray(payload) ? payload : payload.docs;
+    const sourceUrls = Array.isArray(payload) ? "" : payload.knowledgeSourceUrls;
+    if (sourceUrls && config.knowledgeSourceUrls && sourceUrls !== config.knowledgeSourceUrls) return [];
+    return Array.isArray(docs) ? docs.filter((doc) => doc && doc.content && doc.title && doc.url) : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 const STOP_TOKENS = new Set([
@@ -1056,7 +1128,10 @@ module.exports.isRefreshKnowledgeRequest = isRefreshKnowledgeRequest;
 module.exports.formatAnswerWithSources = formatAnswerWithSources;
 module.exports.loadFolderDocuments = loadFolderDocuments;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
+module.exports.loadPackagedKnowledgeIndex = loadPackagedKnowledgeIndex;
 module.exports.getWikiNode = getWikiNode;
+module.exports.getTenantAccessToken = getTenantAccessToken;
+module.exports.loadDriveFileContent = loadDriveFileContent;
 module.exports.claimMessageForProcessing = claimMessageForProcessing;
 module.exports.hasExistingBotReply = hasExistingBotReply;
 module.exports.clearKnowledgeCache = clearKnowledgeCache;
@@ -1064,6 +1139,7 @@ module.exports.getConfig = getConfig;
 module.exports.extractDocxText = extractDocxText;
 module.exports.extractXlsxText = extractXlsxText;
 module.exports.extractLegacyDocText = extractLegacyDocText;
+module.exports.extractReadableStrings = extractReadableStrings;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;

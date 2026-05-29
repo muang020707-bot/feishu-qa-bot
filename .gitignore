@@ -21,3 +21,5 @@ extracted-hr-kb/
 .s/
 .fc/
 feishu-qa-bot-render-upload.zip
+knowledge-index.json
+deploy-latest.log
