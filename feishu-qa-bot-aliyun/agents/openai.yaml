@@ -1,0 +1,5 @@
+interface:
+  display_name: "飞书问答机器人部署"
+  short_description: "搭建飞书知识库问答机器人"
+  default_prompt: "Use $feishu-qa-bot-aliyun to deploy a Feishu knowledge-base Q&A bot on Alibaba Cloud Function Compute."
+
