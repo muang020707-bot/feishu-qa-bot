@@ -141,6 +141,42 @@ test("loads docx shortcuts from drive folders", async () => {
   assert.match(docs[0].content, /考勤制度/);
 });
 
+test("loads documents from nested drive folders", async () => {
+  const docs = await bot.loadKnowledgeDocuments(
+    {
+      knowledgeSourceUrls: "https://vcnh0ynuo3yd.feishu.cn/drive/folder/rootfolder"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      listFolderFiles: async (folderToken) => {
+        if (folderToken === "rootfolder") {
+          return [
+            {
+              name: "04-考勤休假",
+              type: "folder",
+              token: "attendance-folder",
+              url: "https://example.feishu.cn/drive/folder/attendance-folder"
+            }
+          ];
+        }
+        return [
+          {
+            name: "考勤制度",
+            type: "docx",
+            token: "attendance-doc",
+            url: "https://example.feishu.cn/docx/attendance-doc"
+          }
+        ];
+      },
+      fetchDocxRawContent: async (token) => `来自 ${token} 的考勤制度`
+    }
+  );
+  assert.equal(docs.length, 1);
+  assert.equal(docs[0].title, "04-考勤休假 - 考勤制度");
+  assert.equal(docs[0].url, "https://example.feishu.cn/docx/attendance-doc");
+  assert.match(docs[0].content, /考勤制度/);
+});
+
 test("handles mentioned event with mocked dependencies", async () => {
   let replied = "";
   const result = await bot.handleFeishuEvent(

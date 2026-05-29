@@ -119,6 +119,15 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+async function mapLimit(items, limit, mapper) {
+  const results = [];
+  for (let index = 0; index < items.length; index += limit) {
+    const batch = items.slice(index, index + limit);
+    results.push(...(await Promise.all(batch.map(mapper))));
+  }
+  return results;
+}
+
 async function getTenantAccessToken(config) {
   const data = await jsonRequest("POST", `${FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal`, {
     body: {
@@ -131,15 +140,22 @@ async function getTenantAccessToken(config) {
 }
 
 async function listFolderFiles(folderToken, tenantAccessToken) {
-  const params = new URLSearchParams({
-    folder_token: folderToken,
-    page_size: "100"
-  });
-  const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files?${params}`, {
-    headers: { Authorization: `Bearer ${tenantAccessToken}` }
-  });
-  if (data.code !== 0) throw new Error(`Feishu folder list error: ${data.msg || data.code}`);
-  return (data.data && data.data.files) || [];
+  const files = [];
+  let pageToken = "";
+  do {
+    const params = new URLSearchParams({
+      folder_token: folderToken,
+      page_size: "100"
+    });
+    if (pageToken) params.set("page_token", pageToken);
+    const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files?${params}`, {
+      headers: { Authorization: `Bearer ${tenantAccessToken}` }
+    });
+    if (data.code !== 0) throw new Error(`Feishu folder list error: ${data.msg || data.code}`);
+    files.push(...((data.data && data.data.files) || []));
+    pageToken = data.data && data.data.has_more ? data.data.page_token || "" : "";
+  } while (pageToken);
+  return files;
 }
 
 async function fetchDocxRawContent(documentId, tenantAccessToken) {
@@ -202,6 +218,37 @@ async function loadWikiNodeDocuments(node, tenantAccessToken, deps, sourceUrl, d
   return docs;
 }
 
+async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceUrl, parentTitle = "", depth = 0) {
+  if (!folderToken || depth > 6) return [];
+  const files = await (deps.listFolderFiles || listFolderFiles)(folderToken, tenantAccessToken);
+  const docs = [];
+  const documentFiles = [];
+
+  for (const file of files) {
+    const targetType = file.type === "shortcut" && file.shortcut_info ? file.shortcut_info.target_type : file.type;
+    const targetToken = file.type === "shortcut" && file.shortcut_info ? file.shortcut_info.target_token : file.token;
+    const title = [parentTitle, file.name || targetToken].filter(Boolean).join(" - ");
+
+    if (targetType === "folder") {
+      docs.push(...(await loadFolderDocuments(targetToken, tenantAccessToken, deps, file.url || sourceUrl, title, depth + 1)));
+    } else if (targetType === "docx" || targetType === "doc") {
+      documentFiles.push({ targetType, targetToken, title, url: file.url || sourceUrl });
+    }
+  }
+
+  const loadedDocuments = await mapLimit(documentFiles, 3, async (file) => {
+    if (file.targetType === "docx") {
+      const content = await (deps.fetchDocxRawContent || fetchDocxRawContent)(file.targetToken, tenantAccessToken);
+      return { title: file.title, url: file.url, content };
+    }
+    const content = await (deps.fetchLegacyDocRawContent || fetchLegacyDocRawContent)(file.targetToken, tenantAccessToken);
+    return { title: file.title, url: file.url, content };
+  });
+  docs.push(...loadedDocuments);
+
+  return docs;
+}
+
 async function loadKnowledgeDocuments(config, deps = {}) {
   const cacheKey = config.knowledgeSourceUrls || "";
   if (!deps.disableCache && knowledgeCache && knowledgeCache.key === cacheKey && Date.now() - knowledgeCache.loadedAt < KNOWLEDGE_CACHE_TTL_MS) {
@@ -214,18 +261,7 @@ async function loadKnowledgeDocuments(config, deps = {}) {
 
   for (const source of sourceLinks) {
     if (source.type === "folder") {
-      const files = await (deps.listFolderFiles || listFolderFiles)(source.token, tenantAccessToken);
-      for (const file of files) {
-        const targetType = file.type === "shortcut" && file.shortcut_info ? file.shortcut_info.target_type : file.type;
-        const targetToken = file.type === "shortcut" && file.shortcut_info ? file.shortcut_info.target_token : file.token;
-        if (targetType === "docx") {
-          const content = await (deps.fetchDocxRawContent || fetchDocxRawContent)(targetToken, tenantAccessToken);
-          docs.push({ title: file.name || targetToken, url: file.url || source.url, content });
-        } else if (targetType === "doc") {
-          const content = await (deps.fetchLegacyDocRawContent || fetchLegacyDocRawContent)(targetToken, tenantAccessToken);
-          docs.push({ title: file.name || targetToken, url: file.url || source.url, content });
-        }
-      }
+      docs.push(...(await loadFolderDocuments(source.token, tenantAccessToken, deps, source.url)));
     } else if (source.type === "docx") {
       const content = await (deps.fetchDocxRawContent || fetchDocxRawContent)(source.token, tenantAccessToken);
       docs.push({ title: source.token, url: source.url, content });
@@ -439,6 +475,7 @@ module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
 module.exports.isKnowledgeMaterialRequest = isKnowledgeMaterialRequest;
 module.exports.findKnowledgeMaterials = findKnowledgeMaterials;
 module.exports.formatKnowledgeMaterialsReply = formatKnowledgeMaterialsReply;
+module.exports.loadFolderDocuments = loadFolderDocuments;
 module.exports.loadKnowledgeDocuments = loadKnowledgeDocuments;
 module.exports.getWikiNode = getWikiNode;
 module.exports.extractModelText = extractModelText;
