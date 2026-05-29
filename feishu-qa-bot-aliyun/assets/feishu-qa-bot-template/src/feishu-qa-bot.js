@@ -1,6 +1,7 @@
 "use strict";
 
 const https = require("https");
+const zlib = require("zlib");
 
 const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
 const DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
@@ -68,6 +69,50 @@ function jsonRequest(method, url, { headers = {}, body, timeoutMs = 30000 } = {}
             return;
           }
           resolve(data);
+        });
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error(`Request timed out: ${url}`)));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function binaryRequest(method, url, { headers = {}, body, timeoutMs = 30000, redirectCount = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    const req = https.request(
+      {
+        method,
+        hostname: parsed.hostname,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: {
+          Accept: "*/*",
+          ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
+          ...headers
+        },
+        timeout: timeoutMs
+      },
+      (res) => {
+        const location = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && location && redirectCount < 3) {
+          res.resume();
+          const nextUrl = new URL(location, url).toString();
+          binaryRequest(method, nextUrl, { headers, body, timeoutMs, redirectCount: redirectCount + 1 }).then(resolve, reject);
+          return;
+        }
+
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          const buffer = Buffer.concat(chunks);
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`HTTP ${res.statusCode} ${url}: ${buffer.toString("utf8", 0, Math.min(buffer.length, 300))}`));
+            return;
+          }
+          resolve({ buffer, headers: res.headers });
         });
       }
     );
@@ -202,6 +247,173 @@ async function fetchLegacyDocRawContent(docToken, tenantAccessToken) {
   return (data.data && data.data.content) || "";
 }
 
+async function downloadDriveFile(fileToken, tenantAccessToken) {
+  const data = await binaryRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files/${fileToken}/download`, {
+    headers: { Authorization: `Bearer ${tenantAccessToken}` },
+    timeoutMs: 45000
+  });
+  const contentType = String(data.headers["content-type"] || "");
+  if (contentType.includes("application/json")) {
+    const payload = JSON.parse(data.buffer.toString("utf8") || "{}");
+    if (payload.code && payload.code !== 0) throw new Error(`Feishu file download error: ${payload.msg || payload.code}`);
+  }
+  return data.buffer;
+}
+
+function decodeXmlEntities(text) {
+  return String(text || "")
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'");
+}
+
+function xmlToText(xml) {
+  return decodeXmlEntities(
+    String(xml || "")
+      .replace(/<w:tab\s*\/>/g, "\t")
+      .replace(/<\/w:p>/g, "\n")
+      .replace(/<\/w:tr>/g, "\n")
+      .replace(/<\/w:tc>/g, "\t")
+      .replace(/<[^>]+>/g, "")
+  )
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function findZipEntry(buffer, entryName) {
+  const eocdSignature = 0x06054b50;
+  let eocdOffset = -1;
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 66000); offset -= 1) {
+    if (buffer.readUInt32LE(offset) === eocdSignature) {
+      eocdOffset = offset;
+      break;
+    }
+  }
+  if (eocdOffset < 0) return null;
+
+  const totalEntries = buffer.readUInt16LE(eocdOffset + 10);
+  let centralOffset = buffer.readUInt32LE(eocdOffset + 16);
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (buffer.readUInt32LE(centralOffset) !== 0x02014b50) return null;
+    const method = buffer.readUInt16LE(centralOffset + 10);
+    const compressedSize = buffer.readUInt32LE(centralOffset + 20);
+    const fileNameLength = buffer.readUInt16LE(centralOffset + 28);
+    const extraLength = buffer.readUInt16LE(centralOffset + 30);
+    const commentLength = buffer.readUInt16LE(centralOffset + 32);
+    const localHeaderOffset = buffer.readUInt32LE(centralOffset + 42);
+    const fileName = buffer.toString("utf8", centralOffset + 46, centralOffset + 46 + fileNameLength);
+
+    if (fileName === entryName) {
+      const localNameLength = buffer.readUInt16LE(localHeaderOffset + 26);
+      const localExtraLength = buffer.readUInt16LE(localHeaderOffset + 28);
+      const dataOffset = localHeaderOffset + 30 + localNameLength + localExtraLength;
+      const compressed = buffer.subarray(dataOffset, dataOffset + compressedSize);
+      if (method === 0) return compressed;
+      if (method === 8) return zlib.inflateRawSync(compressed);
+      return null;
+    }
+
+    centralOffset += 46 + fileNameLength + extraLength + commentLength;
+  }
+  return null;
+}
+
+function listZipEntries(buffer) {
+  const entries = [];
+  const eocdSignature = 0x06054b50;
+  let eocdOffset = -1;
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 66000); offset -= 1) {
+    if (buffer.readUInt32LE(offset) === eocdSignature) {
+      eocdOffset = offset;
+      break;
+    }
+  }
+  if (eocdOffset < 0) return entries;
+
+  const totalEntries = buffer.readUInt16LE(eocdOffset + 10);
+  let centralOffset = buffer.readUInt32LE(eocdOffset + 16);
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (buffer.readUInt32LE(centralOffset) !== 0x02014b50) return entries;
+    const fileNameLength = buffer.readUInt16LE(centralOffset + 28);
+    const extraLength = buffer.readUInt16LE(centralOffset + 30);
+    const commentLength = buffer.readUInt16LE(centralOffset + 32);
+    entries.push(buffer.toString("utf8", centralOffset + 46, centralOffset + 46 + fileNameLength));
+    centralOffset += 46 + fileNameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function extractDocxText(buffer) {
+  const entries = ["word/document.xml", ...listZipEntries(buffer).filter((name) => /^word\/(header|footer)\d+\.xml$/.test(name))];
+  return entries
+    .map((entry) => {
+      const xml = findZipEntry(buffer, entry);
+      return xml ? xmlToText(xml.toString("utf8")) : "";
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function extractTextNodes(xml) {
+  return [...String(xml || "").matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((match) => decodeXmlEntities(match[1])).join("");
+}
+
+function extractXlsxText(buffer) {
+  const sharedXml = findZipEntry(buffer, "xl/sharedStrings.xml");
+  const sharedStrings = sharedXml
+    ? [...sharedXml.toString("utf8").matchAll(/<si[^>]*>([\s\S]*?)<\/si>/g)].map((match) => extractTextNodes(match[1]))
+    : [];
+  const sheetNames = listZipEntries(buffer).filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/.test(name));
+  const rows = [];
+
+  for (const sheetName of sheetNames) {
+    const sheet = findZipEntry(buffer, sheetName);
+    if (!sheet) continue;
+    const sheetXml = sheet.toString("utf8");
+    for (const rowMatch of sheetXml.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells = [];
+      for (const cellMatch of rowMatch[1].matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g)) {
+        const attrs = cellMatch[1];
+        const cellXml = cellMatch[2];
+        const value = (cellXml.match(/<v>([\s\S]*?)<\/v>/) || [])[1];
+        if (attrs.includes('t="s"') && value !== undefined) {
+          cells.push(sharedStrings[Number(value)] || "");
+        } else if (attrs.includes('t="inlineStr"')) {
+          cells.push(extractTextNodes(cellXml));
+        } else if (value !== undefined) {
+          cells.push(decodeXmlEntities(value));
+        }
+      }
+      const row = cells.map((cell) => String(cell || "").trim()).filter(Boolean).join("\t");
+      if (row) rows.push(row);
+    }
+  }
+
+  return rows.join("\n").trim();
+}
+
+function getFileExtension(name) {
+  const match = String(name || "").toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match ? match[1] : "";
+}
+
+function canExtractDriveFile(fileExtension) {
+  return fileExtension === "docx" || fileExtension === "xlsx";
+}
+
+async function loadDriveFileContent(file, tenantAccessToken, deps = {}) {
+  if (!file || !canExtractDriveFile(file.fileExtension)) return "";
+  const buffer = await (deps.downloadDriveFile || downloadDriveFile)(file.fileToken, tenantAccessToken);
+  if (file.fileExtension === "docx") return (deps.extractDocxText || extractDocxText)(buffer);
+  if (file.fileExtension === "xlsx") return (deps.extractXlsxText || extractXlsxText)(buffer);
+  return "";
+}
+
 async function getWikiNode(wikiToken, tenantAccessToken) {
   const params = new URLSearchParams({ token: wikiToken, obj_type: "wiki" });
   const data = await jsonRequest("GET", `${FEISHU_BASE_URL}/wiki/v2/spaces/get_node?${params}`, {
@@ -261,6 +473,16 @@ async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceU
       docs.push(...(await loadFolderDocuments(targetToken, tenantAccessToken, deps, file.url || sourceUrl, title, depth + 1)));
     } else if (targetType === "docx" || targetType === "doc") {
       documentFiles.push({ targetType, targetToken, title, url: file.url || sourceUrl });
+    } else if (targetType === "file") {
+      const fileExtension = getFileExtension(file.name || title);
+      docs.push({
+        title,
+        url: file.url || sourceUrl,
+        content: title,
+        fileToken: targetToken,
+        fileExtension,
+        canExtractContent: canExtractDriveFile(fileExtension)
+      });
     }
   }
 
@@ -310,10 +532,63 @@ async function loadKnowledgeDocuments(config, deps = {}) {
   return filteredDocs;
 }
 
+const STOP_TOKENS = new Set([
+  "什么",
+  "怎么",
+  "怎样",
+  "如何",
+  "有没有",
+  "是否",
+  "需要",
+  "可以",
+  "员工",
+  "公司",
+  "一下",
+  "这个",
+  "那个",
+  "有什",
+  "么要",
+  "的是"
+]);
+
+const QUERY_EXPANSIONS = [
+  {
+    pattern: /入职|新人|新员工|录用|报到|试岗|试用/,
+    terms: ["入职", "新员工", "新人", "录用", "报到", "试岗", "试用", "入职管理", "入职手续", "入职须知", "录取通知", "合同签署"]
+  },
+  {
+    pattern: /注意|事项|准备|材料|要注意|须知|流程|手续/,
+    terms: ["注意", "事项", "准备", "材料", "须知", "明细", "流程", "手续", "确认", "签署", "承诺书", "保密协议", "劳动合同", "薪资组成"]
+  },
+  {
+    pattern: /考勤|打卡|上班|下班|迟到|早退|休假|请假|加班/,
+    terms: ["考勤", "打卡", "上班", "下班", "迟到", "早退", "休假", "请假", "加班", "排班", "月度汇总"]
+  },
+  {
+    pattern: /转正|调岗|调薪|涨薪|试用期/,
+    terms: ["转正", "调岗", "调薪", "涨薪", "试用期", "审批单", "通知书"]
+  },
+  {
+    pattern: /离职|辞职|解除|交接/,
+    terms: ["离职", "辞职", "解除", "交接", "离职证明", "离职协议"]
+  }
+];
+
 function tokenize(text) {
   const lower = String(text || "").toLowerCase();
-  const words = lower.match(/[a-z0-9]+|[\u4e00-\u9fa5]{1,2}/g) || [];
-  return words.filter((word) => word.trim().length > 0);
+  const words = lower.match(/[a-z0-9]+|[\u4e00-\u9fa5]{1,4}/g) || [];
+  return words.filter((word) => word.trim().length > 0 && !STOP_TOKENS.has(word));
+}
+
+function expandQueryTokens(question) {
+  const text = String(question || "");
+  const tokens = new Set(tokenize(text));
+  for (const expansion of QUERY_EXPANSIONS) {
+    if (expansion.pattern.test(text)) {
+      for (const term of expansion.terms) tokens.add(term.toLowerCase());
+    }
+  }
+  return [...tokens].filter(Boolean);
 }
 
 function chunkDocument(doc, maxChars = 900) {
@@ -325,29 +600,69 @@ function chunkDocument(doc, maxChars = 900) {
   let current = "";
   for (const paragraph of paragraphs) {
     if ((current + "\n" + paragraph).length > maxChars && current) {
-      chunks.push({ title: doc.title, url: doc.url, text: current });
+      chunks.push({ ...doc, text: current });
       current = paragraph;
     } else {
       current = current ? `${current}\n${paragraph}` : paragraph;
     }
   }
-  if (current) chunks.push({ title: doc.title, url: doc.url, text: current });
+  if (current) chunks.push({ ...doc, text: current });
   return chunks;
 }
 
 function retrieveRelevantChunks(question, docs, limit = 6) {
-  const qTokens = tokenize(question);
+  const qTokens = expandQueryTokens(question);
   if (!qTokens.length) return [];
+  const questionLower = String(question || "").toLowerCase().replace(/\s+/g, "");
   const chunks = docs.flatMap((doc) => chunkDocument(doc));
   return chunks
     .map((chunk) => {
-      const haystack = `${chunk.title}\n${chunk.text}`.toLowerCase();
-      const score = qTokens.reduce((sum, token) => sum + (haystack.includes(token) ? 1 : 0), 0);
+      const title = String(chunk.title || "").toLowerCase();
+      const text = String(chunk.text || "").toLowerCase();
+      const haystack = `${title}\n${text}`;
+      let score = title.replace(/\s+/g, "").includes(questionLower) ? 30 : 0;
+      if (/入职/.test(question) && /注意|事项|须知|要注意/.test(question) && /入职须知/.test(chunk.title || "")) score += 25;
+      if (/入职/.test(question) && /注意|事项|须知|要注意/.test(question) && /入职须知明细表/.test(chunk.title || "")) score += 15;
+      for (const token of qTokens) {
+        if (title.includes(token)) score += token.length >= 3 ? 8 : 5;
+        if (text.includes(token)) score += token.length >= 3 ? 3 : 1;
+      }
+      if (chunk.canExtractContent && score > 0) score += 5;
+      score -= Math.max(0, String(chunk.title || "").split(" - ").length - 4) * 3;
       return { ...chunk, score };
     })
     .filter((chunk) => chunk.score > 0)
     .sort((a, b) => b.score - a.score || b.text.length - a.text.length)
     .slice(0, limit);
+}
+
+async function hydrateRelevantChunks(question, chunks, tenantAccessToken, deps = {}, limit = 4) {
+  const files = [];
+  const seen = new Set();
+  for (const chunk of chunks) {
+    if (!chunk.canExtractContent || !chunk.fileToken || seen.has(chunk.fileToken)) continue;
+    seen.add(chunk.fileToken);
+    files.push(chunk);
+    if (files.length >= limit) break;
+  }
+  if (!files.length) return chunks;
+
+  const hydratedDocs = [];
+  for (const file of files) {
+    try {
+      const content = await loadDriveFileContent(file, tenantAccessToken, deps);
+      if (content && content.trim()) {
+        hydratedDocs.push({ ...file, content, canExtractContent: false });
+      }
+    } catch (_) {
+      // Keep the title-only match if a single file cannot be downloaded or parsed.
+    }
+  }
+
+  const hydratedChunks = retrieveRelevantChunks(question, hydratedDocs, chunks.length || 6);
+  if (!hydratedChunks.length) return chunks;
+  const hydratedTokens = new Set(hydratedDocs.map((doc) => doc.fileToken));
+  return [...hydratedChunks, ...chunks.filter((chunk) => !hydratedTokens.has(chunk.fileToken))].slice(0, chunks.length || 6);
 }
 
 function isKnowledgeMaterialRequest(question) {
@@ -372,7 +687,7 @@ function normalizeMaterialQuery(question) {
 
 function findKnowledgeMaterials(question, docs, limit = 5) {
   const query = normalizeMaterialQuery(question) || String(question || "").trim();
-  const qTokens = tokenize(query);
+  const qTokens = expandQueryTokens(query);
   const candidates = docs.filter((doc) => doc && doc.url && doc.title);
 
   if (!qTokens.length) return candidates.slice(0, limit);
@@ -559,7 +874,12 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
       return { ignored: false, question, materialMatches: materials.length };
     }
 
-    const chunks = retrieveRelevantChunks(question, docs);
+    const chunks = await (deps.hydrateRelevantChunks || hydrateRelevantChunks)(
+      question,
+      retrieveRelevantChunks(question, docs),
+      tenantAccessToken,
+      deps
+    );
     const answer = await (deps.askOpenAI || askOpenAI)(question, chunks, config);
     await (deps.replyToFeishuMessage || replyToFeishuMessage)(message.message_id, formatAnswerWithSources(answer, chunks), tenantAccessToken);
     return { ignored: false, question, matchedChunks: chunks.length };
@@ -586,6 +906,7 @@ module.exports.shouldReplyToEvent = shouldReplyToEvent;
 module.exports.normalizeQuestion = normalizeQuestion;
 module.exports.extractFeishuLink = extractFeishuLink;
 module.exports.retrieveRelevantChunks = retrieveRelevantChunks;
+module.exports.hydrateRelevantChunks = hydrateRelevantChunks;
 module.exports.isKnowledgeMaterialRequest = isKnowledgeMaterialRequest;
 module.exports.findKnowledgeMaterials = findKnowledgeMaterials;
 module.exports.formatKnowledgeMaterialsReply = formatKnowledgeMaterialsReply;
@@ -597,6 +918,9 @@ module.exports.getWikiNode = getWikiNode;
 module.exports.claimMessageForProcessing = claimMessageForProcessing;
 module.exports.hasExistingBotReply = hasExistingBotReply;
 module.exports.clearKnowledgeCache = clearKnowledgeCache;
+module.exports.getConfig = getConfig;
+module.exports.extractDocxText = extractDocxText;
+module.exports.extractXlsxText = extractXlsxText;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;

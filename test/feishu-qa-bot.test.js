@@ -68,6 +68,42 @@ test("retrieves relevant chunks from knowledge documents", () => {
   assert.match(chunks[0].text, /考勤|工作时间|打卡/);
 });
 
+test("retrieves uploaded file candidates by expanded onboarding terms", () => {
+  const title = "02-入职管理 - 试岗期-入职须知 - 入职须知明细表.xlsx";
+  const chunks = bot.retrieveRelevantChunks("员工入职有什么要注意的", [
+    {
+      title,
+      url: "https://example.feishu.cn/file/onboarding",
+      content: title,
+      fileToken: "file-onboarding",
+      fileExtension: "xlsx",
+      canExtractContent: true
+    }
+  ]);
+  assert.ok(chunks.length > 0);
+  assert.equal(chunks[0].fileToken, "file-onboarding");
+});
+
+test("hydrates matching uploaded files before answering", async () => {
+  const title = "02-入职管理 - 试岗期-入职须知 - 入职须知明细表.xlsx";
+  const initialChunks = bot.retrieveRelevantChunks("员工入职有什么要注意的", [
+    {
+      title,
+      url: "https://example.feishu.cn/file/onboarding",
+      content: title,
+      fileToken: "file-onboarding",
+      fileExtension: "xlsx",
+      canExtractContent: true
+    }
+  ]);
+  const hydrated = await bot.hydrateRelevantChunks("员工入职有什么要注意的", initialChunks, "tenant-token", {
+    downloadDriveFile: async () => Buffer.from("mock xlsx"),
+    extractXlsxText: () => "入职注意事项：签署劳动合同、保密协议、入职承诺书，并确认薪资组成。"
+  });
+  assert.match(hydrated[0].text, /劳动合同/);
+  assert.equal(hydrated[0].canExtractContent, false);
+});
+
 test("recognizes direct material requests", () => {
   assert.equal(bot.isKnowledgeMaterialRequest("给我劳动合同"), true);
   assert.equal(bot.isKnowledgeMaterialRequest("发一下员工手册文档"), true);
@@ -241,6 +277,46 @@ test("handles mentioned event with mocked dependencies", async () => {
   assert.match(replied, /打卡/);
 });
 
+test("hydrates uploaded file matches in mentioned events", async () => {
+  let modelChunks = [];
+  let replied = "";
+  const result = await bot.handleFeishuEvent(
+    event("@_user_1 员工入职有什么要注意的", [
+      { key: "@_user_1", name: "牧火人事助手", id: { open_id: "ou_bot" } }
+    ]),
+    {
+      botOpenId: "ou_bot",
+      knowledgeSourceUrls: "https://example.feishu.cn/drive/folder/root",
+      openaiApiKey: "test"
+    },
+    {
+      tenantAccessToken: "tenant-token",
+      loadKnowledgeDocuments: async () => [
+        {
+          title: "02-入职管理 - 试岗期-入职须知 - 入职须知明细表.xlsx",
+          url: "https://example.feishu.cn/file/onboarding",
+          content: "02-入职管理 - 试岗期-入职须知 - 入职须知明细表.xlsx",
+          fileToken: "file-onboarding",
+          fileExtension: "xlsx",
+          canExtractContent: true
+        }
+      ],
+      downloadDriveFile: async () => Buffer.from("mock xlsx"),
+      extractXlsxText: () => "入职注意事项：签署劳动合同、保密协议、入职承诺书，并确认薪资组成。",
+      askOpenAI: async (_question, chunks) => {
+        modelChunks = chunks;
+        return "入职时需要签署劳动合同、保密协议、入职承诺书，并确认薪资组成。";
+      },
+      replyToFeishuMessage: async (_messageId, text) => {
+        replied = text;
+      }
+    }
+  );
+  assert.equal(result.ignored, false);
+  assert.match(modelChunks[0].text, /入职注意事项/);
+  assert.match(replied, /依据文档/);
+});
+
 test("handles direct material request without calling the model", async () => {
   let replied = "";
   let modelCalled = false;
@@ -398,4 +474,19 @@ test("extracts text from OpenAI-compatible chat completions", () => {
     bot.extractModelText({ choices: [{ message: { content: "千问回答" } }] }),
     "千问回答"
   );
+});
+
+test("prefers DashScope key so runtime does not depend on Codex quota", () => {
+  const previousDashscope = process.env.DASHSCOPE_API_KEY;
+  const previousOpenai = process.env.OPENAI_API_KEY;
+  process.env.DASHSCOPE_API_KEY = "dashscope-test-key";
+  process.env.OPENAI_API_KEY = "openai-test-key";
+  try {
+    assert.equal(bot.getConfig().openaiApiKey, "dashscope-test-key");
+  } finally {
+    if (previousDashscope === undefined) delete process.env.DASHSCOPE_API_KEY;
+    else process.env.DASHSCOPE_API_KEY = previousDashscope;
+    if (previousOpenai === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenai;
+  }
 });
