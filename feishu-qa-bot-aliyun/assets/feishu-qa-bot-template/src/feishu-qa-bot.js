@@ -680,7 +680,7 @@ const QUERY_EXPANSIONS = [
     terms: ["入职", "新员工", "新人", "录用", "报到", "试岗", "试用", "入职管理", "入职手续", "入职须知", "录取通知", "合同签署"]
   },
   {
-    pattern: /注意|事项|准备|材料|要注意|须知|流程|手续/,
+    pattern: /(?:入职|新人|新员工|录用|报到|试岗|试用).*(?:注意|事项|准备|材料|须知|流程|手续)|(?:注意|事项|准备|材料|须知|流程|手续).*(?:入职|新人|新员工|录用|报到|试岗|试用)/,
     terms: ["注意", "事项", "准备", "材料", "须知", "明细", "流程", "手续", "确认", "签署", "承诺书", "保密协议", "劳动合同", "薪资组成"]
   },
   {
@@ -707,7 +707,20 @@ const QUERY_EXPANSIONS = [
 
 async function inferKnowledgeHints(question, docs, config, deps = {}) {
   if (!config.openaiApiKey || !docs.length) return { keywords: [], titleIndexes: [] };
-  const catalog = docs.slice(0, TITLE_CATALOG_LIMIT).map((doc, index) => `${index + 1}. ${doc.title}`).join("\n");
+  const catalogDocs = docs.slice(0, TITLE_CATALOG_LIMIT);
+  const titleCatalog = catalogDocs.map((doc, index) => `${index + 1}. ${doc.title}`).join("\n");
+  const pptCatalog = catalogDocs
+    .map((doc, index) => ({ doc, index }))
+    .filter(({ doc }) => String(doc.fileExtension || "").toLowerCase() === "pptx")
+    .map(({ doc, index }) => {
+      const content = String(doc.content || "").replace(/\s+/g, " ").trim();
+      return `${index + 1}. ${doc.title}\nPPT正文：${content}`;
+    })
+    .join("\n\n")
+    .slice(0, 60000);
+  const catalog = pptCatalog
+    ? `${titleCatalog}\n\n以下是PPT提取出的正文，必须用于理解产品名、价格、规格、卖点、注意事项和同义表达：\n${pptCatalog}`
+    : titleCatalog;
   const data = await (deps.jsonRequest || jsonRequest)("POST", `${config.openaiBaseUrl || DEFAULT_LLM_BASE_URL}/chat/completions`, {
     headers: { Authorization: `Bearer ${config.openaiApiKey}` },
     timeoutMs: 20000,
@@ -717,7 +730,7 @@ async function inferKnowledgeHints(question, docs, config, deps = {}) {
       messages: [
         {
           role: "system",
-          content: "你是企业知识库检索助手。根据用户问题和资料标题目录，找出最可能相关的资料序号和检索关键词。只输出 JSON，不要解释。"
+          content: "你是企业知识库检索助手。根据用户问题、资料标题目录以及PPT正文，找出最可能相关的资料序号和检索关键词。PPT正文中的产品名、规格、价格、卖点、注意事项和同义表达都可作为检索依据。只输出 JSON，不要解释。"
         },
         {
           role: "user",
@@ -810,7 +823,10 @@ function retrieveRelevantChunks(question, docs, limit = 6) {
       if (/入职/.test(question) && /注意|事项|须知|要注意/.test(question) && /入职须知明细表/.test(chunk.title || "")) score += 15;
       for (const token of qTokens) {
         if (title.includes(token)) score += token.length >= 3 ? 8 : 5;
-        if (text.includes(token)) score += token.length >= 3 ? 3 : 1;
+        if (text.includes(token)) {
+          const occurrences = Math.min(5, text.split(token).length - 1);
+          score += token.length >= 3 ? occurrences * 3 : occurrences;
+        }
       }
       if (chunk.canExtractContent && score > 0) score += 5;
       score -= Math.max(0, String(chunk.title || "").split(" - ").length - 4) * 3;
@@ -949,7 +965,10 @@ function formatAnswerWithSources(answer, chunks, limit = 3) {
 
   const sources = [];
   const seen = new Set();
-  for (const chunk of chunks) {
+  const sourceChunks = chunks.some((chunk) => Number(chunk.score || 0) >= 1000)
+    ? chunks.filter((chunk) => Number(chunk.score || 0) >= 1000)
+    : chunks;
+  for (const chunk of sourceChunks) {
     const key = `${chunk.title}\n${chunk.url}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -1103,7 +1122,8 @@ async function handleFeishuEvent(event, config = getConfig(), deps = {}) {
 
     let hints = { keywords: [], titleIndexes: [] };
     let relevantChunks = retrieveRelevantChunks(question, docs);
-    if (!relevantChunks.length) {
+    const topChunkScore = relevantChunks.length ? Number(relevantChunks[0].score || 0) : 0;
+    if (!relevantChunks.length || topChunkScore < 20) {
       hints = await (deps.inferKnowledgeHints || inferKnowledgeHints)(question, docs, config, deps);
       const hintedQuestion = withRetrievalHints(question, hints);
       relevantChunks = mergeHintedDocsIntoChunks(retrieveRelevantChunks(hintedQuestion, docs), docs, hints);

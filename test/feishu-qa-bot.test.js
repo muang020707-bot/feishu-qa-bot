@@ -87,6 +87,24 @@ test("retrieves uploaded file candidates by expanded onboarding terms", () => {
   assert.equal(chunks[0].fileToken, "file-onboarding");
 });
 
+test("prefers an exact product document over generic onboarding documents", () => {
+  const chunks = bot.retrieveRelevantChunks("小悬灸要注意什么", [
+    {
+      title: "薪资组成确认单.xlsx",
+      url: "https://example.feishu.cn/file/salary",
+      content: "签署劳动合同并确认薪资组成。"
+    },
+    {
+      title: "2026牧火主推爆品手卡.pptx",
+      url: "https://example.feishu.cn/file/product",
+      content: "牧火小悬灸使用时注意控温，向上旋拧盖子调低温度，避免烫伤。"
+    }
+  ]);
+  assert.ok(chunks.length > 0);
+  assert.equal(chunks[0].title, "2026牧火主推爆品手卡.pptx");
+  assert.match(chunks[0].text, /避免烫伤/);
+});
+
 test("hydrates matching uploaded files before answering", async () => {
   const title = "02-入职管理 - 试岗期-入职须知 - 入职须知明细表.xlsx";
   const initialChunks = bot.retrieveRelevantChunks("员工入职有什么要注意的", [
@@ -188,6 +206,39 @@ test("finds roster materials with suffix send wording", () => {
   assert.equal(materials[0].title, "01-招聘管理 - 人才画像.xls");
 });
 
+test("includes PPT body text in semantic retrieval hints", async () => {
+  let requestBody;
+  const hints = await bot.inferKnowledgeHints(
+    "这个便携艾灸产品使用时要注意什么",
+    [
+      {
+        title: "2026牧火主推爆品手卡.pptx",
+        url: "https://example.feishu.cn/file/products",
+        fileExtension: "pptx",
+        content: "产品名称牧火小悬灸。向上旋拧盖子调低温度，避免烫伤。"
+      }
+    ],
+    { openaiApiKey: "test", openaiModel: "qwen-plus" },
+    {
+      jsonRequest: async (_method, _url, options) => {
+        requestBody = options.body;
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ keywords: ["牧火小悬灸", "避免烫伤"], titleIndexes: [1] })
+              }
+            }
+          ]
+        };
+      }
+    }
+  );
+  assert.match(requestBody.messages[1].content, /PPT正文/);
+  assert.match(requestBody.messages[1].content, /避免烫伤/);
+  assert.deepEqual(hints.titleIndexes, [0]);
+});
+
 test("uses inferred title hints when local material matching misses", async () => {
   let replied = "";
   const result = await bot.handleFeishuEvent(
@@ -285,6 +336,25 @@ test("does not append source documents to unsupported answers", () => {
     }
   ]);
   assert.equal(answer, "知识库暂无明确答案。");
+});
+
+test("only cites semantically selected documents when hints are present", () => {
+  const answer = bot.formatAnswerWithSources("使用时需要注意控温。", [
+    {
+      title: "2026牧火主推爆品手卡.pptx",
+      url: "https://example.feishu.cn/file/product",
+      text: "控温调节",
+      score: 1000
+    },
+    {
+      title: "仓库发货流程.docx",
+      url: "https://example.feishu.cn/file/warehouse",
+      text: "发货流程",
+      score: 4
+    }
+  ]);
+  assert.match(answer, /2026牧火主推爆品手卡/);
+  assert.doesNotMatch(answer, /仓库发货流程/);
 });
 
 test("recognizes wiki knowledge source links", () => {
@@ -434,6 +504,7 @@ test("handles mentioned event with mocked dependencies", async () => {
           content: "公司工作时间 9:00-18:00，上下班需要打卡。"
         }
       ],
+      inferKnowledgeHints: async () => ({ keywords: [], titleIndexes: [] }),
       askOpenAI: async () => "公司工作时间 9:00-18:00，上下班需要打卡。",
       replyToFeishuMessage: async (_messageId, text) => {
         replied = text;
