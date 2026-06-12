@@ -273,6 +273,71 @@ async function fetchLegacyDocRawContent(docToken, tenantAccessToken) {
   return (data.data && data.data.content) || "";
 }
 
+function columnName(columnNumber) {
+  let value = Math.max(1, Number(columnNumber) || 1);
+  let name = "";
+  while (value > 0) {
+    value -= 1;
+    name = String.fromCharCode(65 + (value % 26)) + name;
+    value = Math.floor(value / 26);
+  }
+  return name;
+}
+
+function sheetValuesToText(values) {
+  if (!Array.isArray(values)) return "";
+  return values
+    .map((row) => (Array.isArray(row) ? row : [row])
+      .map((cell) => {
+        if (cell === null || cell === undefined) return "";
+        if (typeof cell === "object") {
+          if (cell.text !== undefined) return String(cell.text);
+          return JSON.stringify(cell);
+        }
+        return String(cell);
+      })
+      .join("\t")
+      .trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function fetchNativeSheetContent(spreadsheetToken, tenantAccessToken, deps = {}) {
+  const request = deps.jsonRequest || jsonRequest;
+  const metadata = await request(
+    "GET",
+    `${FEISHU_BASE_URL}/sheets/v3/spreadsheets/${spreadsheetToken}/sheets/query`,
+    { headers: { Authorization: `Bearer ${tenantAccessToken}` } }
+  );
+  if (metadata.code !== 0) throw new Error(`Feishu sheet metadata error: ${metadata.msg || metadata.code}`);
+
+  const sheets = (metadata.data && metadata.data.sheets) || [];
+  const parts = [];
+  for (const sheet of sheets) {
+    const sheetId = sheet.sheet_id || sheet.sheetId;
+    if (!sheetId) continue;
+    const properties = sheet.grid_properties || sheet.gridProperties || {};
+    const rowCount = Math.min(Number(properties.row_count || properties.rowCount) || 1000, 5000);
+    const columnCount = Math.min(Number(properties.column_count || properties.columnCount) || 26, 100);
+    const range = `${sheetId}!A1:${columnName(columnCount)}${rowCount}`;
+    const query = new URLSearchParams({
+      ranges: range,
+      valueRenderOption: "ToString"
+    });
+    const valuesPayload = await request(
+      "GET",
+      `${FEISHU_BASE_URL}/sheets/v2/spreadsheets/${spreadsheetToken}/values_batch_get?${query}`,
+      { headers: { Authorization: `Bearer ${tenantAccessToken}` } }
+    );
+    if (valuesPayload.code !== 0) continue;
+    const valueRanges = (valuesPayload.data && valuesPayload.data.valueRanges) || [];
+    const values = valueRanges[0] && valueRanges[0].values;
+    const text = sheetValuesToText(values);
+    if (text) parts.push(`工作表：${sheet.title || sheetId}\n${text}`);
+  }
+  return parts.join("\n\n");
+}
+
 async function downloadDriveFile(fileToken, tenantAccessToken) {
   const data = await withFeishuRetry(() => binaryRequest("GET", `${FEISHU_BASE_URL}/drive/v1/files/${fileToken}/download`, {
     headers: { Authorization: `Bearer ${tenantAccessToken}` },
@@ -565,7 +630,7 @@ async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceU
 
     if (targetType === "folder") {
       docs.push(...(await loadFolderDocuments(targetToken, tenantAccessToken, deps, file.url || sourceUrl, title, depth + 1)));
-    } else if (targetType === "docx" || targetType === "doc") {
+    } else if (targetType === "docx" || targetType === "doc" || targetType === "sheet") {
       documentFiles.push({ targetType, targetToken, title, url: file.url || sourceUrl });
     } else if (targetType === "file") {
       const fileExtension = getFileExtension(file.name || title);
@@ -583,6 +648,10 @@ async function loadFolderDocuments(folderToken, tenantAccessToken, deps, sourceU
   const loadedDocuments = await mapLimit(documentFiles, 1, async (file) => {
     if (file.targetType === "docx") {
       const content = await (deps.fetchDocxRawContent || fetchDocxRawContent)(file.targetToken, tenantAccessToken);
+      return { title: file.title, url: file.url, content };
+    }
+    if (file.targetType === "sheet") {
+      const content = await (deps.fetchNativeSheetContent || fetchNativeSheetContent)(file.targetToken, tenantAccessToken, deps);
       return { title: file.title, url: file.url, content };
     }
     const content = await (deps.fetchLegacyDocRawContent || fetchLegacyDocRawContent)(file.targetToken, tenantAccessToken);
@@ -921,6 +990,14 @@ function findKnowledgeMaterialsWithHints(question, docs, hints = {}, limit = 5) 
 
   if (!qTokens.length && !(hints.titleIndexes || []).length && !(hints.keywords || []).length) return candidates.slice(0, limit);
 
+  const compactQuery = query.toLowerCase().replace(/\s+/g, "");
+  const exactTitleMatches = compactQuery
+    ? candidates.filter((doc) => String(doc.title || "").toLowerCase().replace(/\s+/g, "").includes(compactQuery))
+    : [];
+  if (exactTitleMatches.length) {
+    return exactTitleMatches.slice(0, limit).map((doc) => ({ title: doc.title, url: doc.url, score: 100 }));
+  }
+
   const ranked = candidates
     .map((doc, index) => {
       const title = String(doc.title || "").toLowerCase();
@@ -1183,6 +1260,8 @@ module.exports.extractDocxText = extractDocxText;
 module.exports.extractXlsxText = extractXlsxText;
 module.exports.extractLegacyDocText = extractLegacyDocText;
 module.exports.extractReadableStrings = extractReadableStrings;
+module.exports.fetchNativeSheetContent = fetchNativeSheetContent;
+module.exports.sheetValuesToText = sheetValuesToText;
 module.exports.extractModelText = extractModelText;
 module.exports.NO_ANSWER = NO_ANSWER;
 module.exports.NO_MATERIAL = NO_MATERIAL;

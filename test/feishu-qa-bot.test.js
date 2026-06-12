@@ -170,6 +170,22 @@ test("finds knowledge materials by title and returns links", () => {
   assert.match(bot.formatKnowledgeMaterialsReply(materials), /https:\/\/example\.feishu\.cn\/docx\/contract/);
 });
 
+test("returns only exact compact title matches for specific material requests", () => {
+  const materials = bot.findKnowledgeMaterials("每日素材库总统计表发我", [
+    {
+      title: "每日素材库 总统计表",
+      url: "https://example.feishu.cn/sheets/materials",
+      content: "工作表：6月素材"
+    },
+    {
+      title: "员工考勤统计表",
+      url: "https://example.feishu.cn/sheets/attendance",
+      content: "员工考勤统计"
+    }
+  ]);
+  assert.deepEqual(materials.map((item) => item.title), ["每日素材库 总统计表"]);
+});
+
 test("finds personality test materials with synonym matching", () => {
   const materials = bot.findKnowledgeMaterials("给我性格测试要求", [
     {
@@ -408,6 +424,38 @@ test("loads docx shortcuts from drive folders", async () => {
   assert.equal(docs.length, 1);
   assert.equal(docs[0].title, "员工手册");
   assert.match(docs[0].content, /考勤制度/);
+});
+
+test("loads native Feishu sheets from drive folders", async () => {
+  const docs = await bot.loadFolderDocuments(
+    "folder-root",
+    "tenant-token",
+    {
+      listFolderFiles: async () => [
+        {
+          name: "每日素材库 总统计表",
+          type: "sheet",
+          token: "sheet-token",
+          url: "https://example.feishu.cn/sheets/sheet-token"
+        }
+      ],
+      fetchNativeSheetContent: async () => "工作表：总表\n日期\t达人\t素材链接"
+    },
+    "https://example.feishu.cn/drive/folder/root"
+  );
+  assert.equal(docs.length, 1);
+  assert.equal(docs[0].title, "每日素材库 总统计表");
+  assert.match(docs[0].content, /素材链接/);
+});
+
+test("converts native sheet values into searchable text", () => {
+  assert.equal(
+    bot.sheetValuesToText([
+      ["日期", "达人", "素材"],
+      ["2026-06-12", "测试达人", { text: "视频链接" }]
+    ]),
+    "日期\t达人\t素材\n2026-06-12\t测试达人\t视频链接"
+  );
 });
 
 test("loads documents from nested drive folders", async () => {
